@@ -1,13 +1,19 @@
-# The floor the toolchain must clear.  <expected> is the gate: libstdc++ hides it
-# behind __cpp_concepts, which clang++-18 does not define at the level libstdc++
-# asks for, so the header is present and empty.  That does not show up as a
-# version check -- only as a compile.
+# The floor the toolchain must clear, expressed as a compile rather than a
+# version check, because neither half of it shows up as one.
 #
-# The probe asks for <expected> and nothing else, because <expected> is the only
-# library feature the headers cannot be written without.  It used to ask for
-# std::ranges::to as well, which no longer appears anywhere in einsum and which
-# libstdc++ only provides from 14: that turned a clang 20 paired with an older
-# libstdc++ into a refusal to configure over a feature the code never uses.
+# <expected> is the first gate: libstdc++ hides it behind __cpp_concepts, which
+# clang++-18 does not define at the level libstdc++ asks for, so the header is
+# present and declares nothing.
+#
+# The rest is the libstdc++ 14 floor.  It is probed with std::views::enumerate
+# and std::from_range because those are what einsum actually uses -- enumerate
+# in ct/subscripts.hpp and core/einsum_object.hpp, from_range in
+# util/fixed_vec.hpp and core/kernels.hpp.  This probe used to ask for
+# std::ranges::to instead, which stands at the same libstdc++ level but appears
+# nowhere in the library: a compiler could then be refused over a feature the
+# build would never have reached, and -- worse -- the day ranges::to moved
+# without enumerate moving with it, the gate would have been measuring the
+# wrong thing.  Probe what the code needs.
 include_guard(GLOBAL)
 
 include(CheckCXXSourceCompiles)
@@ -15,8 +21,20 @@ include(CheckCXXSourceCompiles)
 set(CMAKE_REQUIRED_FLAGS "-std=c++23")
 check_cxx_source_compiles(
         "#include <expected>
+         #include <ranges>
+         #include <vector>
+         struct Sink {
+           int total = 0;
+           constexpr Sink(std::from_range_t, const std::vector<int> &xs) {
+             for (const auto [i, x] : xs | std::views::enumerate) {
+               total += static_cast<int>(i) * x;
+             }
+           }
+         };
          int main() {
-           return std::expected<int, int>{3}.value() - 3;
+           const std::vector<int> xs{1, 1, 1};
+           const Sink s{std::from_range, xs};
+           return std::expected<int, int>{s.total}.value() - 3;
          }"
         EINSUM_TOOLCHAIN_OK)
 unset(CMAKE_REQUIRED_FLAGS)
@@ -24,9 +42,12 @@ unset(CMAKE_REQUIRED_FLAGS)
 if (NOT MSVC AND NOT EINSUM_TOOLCHAIN_OK)
     message(FATAL_ERROR
             "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} cannot build "
-            "EinsteinSummation, which needs a working <expected>.  Build with GCC 14+ "
-            "or Clang 19+.  Clang 18 is out because libstdc++ gates <expected> on "
-            "__cpp_concepts, which that release does not define high enough -- the "
-            "header is there and declares nothing.  The compiler's own diagnostic is "
-            "in the CMakeConfigureLog.")
+            "EinsteinSummation, which needs <expected>, std::views::enumerate and "
+            "std::from_range.  Build with GCC 14+, or Clang 20+ against libstdc++ 14+ "
+            "-- with clang it is the standard library that decides, not the compiler, "
+            "so a new clang paired with an old libstdc++ lands here.  Clang 18 is out "
+            "on <expected> regardless: libstdc++ gates it on __cpp_concepts, which "
+            "that release does not define high enough, so the header is there and "
+            "declares nothing.  The compiler's own diagnostic is in the "
+            "CMakeConfigureLog.")
 endif ()

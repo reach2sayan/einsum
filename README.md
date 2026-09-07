@@ -32,9 +32,11 @@ Every failure travels through `std::expected`; nothing in any header throws.
 
 Clang 18 and 19 are below the floor: libstdc++ gates `<expected>` on
 `__cpp_concepts` at a level they do not define, so the header is present and
-declares nothing. `std::ranges::to` needs GCC 14. A toolchain probe checks both
-at configure time and names the reason rather than letting the build fail a
-thousand lines in.
+declares nothing. `std::views::enumerate` and `std::from_range`, which the
+headers use throughout, need libstdc++ 14 -- with Clang it is the standard
+library that decides, so a new Clang against an old libstdc++ lands here too. A
+toolchain probe compiles all three at configure time and names the reason rather
+than letting the build fail a thousand lines in.
 
 The top-level `CMakeLists.txt` picks `g++-15` or `g++-14` off `PATH` before
 `project()` unless you set `CMAKE_CXX_COMPILER` or `CXX`, because the default
