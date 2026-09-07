@@ -1,16 +1,17 @@
 #pragma once
 
+#include "einsum/core/kind.hpp"
 #include "einsum/core/view.hpp"
 #include "einsum/util/concepts.hpp"
 #include "einsum/util/error.hpp"
 
 #include <Eigen/Core>
+#include <experimental/mdarray>
 #include <experimental/mdspan>
 
-#include <algorithm>
 #include <array>
-#include <ranges>
 #include <cstddef>
+#include <ranges>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -18,136 +19,201 @@
 
 namespace einsum {
 
-// The scratch a Plan needs, owned or borrowed.  One allocation at bind time and
-// none afterwards is the whole contract; borrow() is for callers who will not
-// even have that one.
-template <CScalar T> class Workspace {
-public:
-  constexpr Workspace() noexcept = default;
+// --- what a call hands back
+// --------------------------------------------------- The result is the
+// operands' own type, so there is no result kind to choose and no accessor to
+// remember: an einsum over Eigen matrices answers an Eigen matrix, one over a
+// vector of vectors answers a vector of vectors.
+//
+// The exception is the view family -- mdspan, and anything else that only
+// borrows its memory -- which cannot own a result at all.  Those get a nest of
+// std::vector of the same scalar and rank, returned by value like every other
+// result: the library never owns an output, so there is nothing whose lifetime
+// a caller has to reason about.
+namespace impl {
 
-  [[nodiscard]] static result<Workspace> make(const std::size_t elems) {
-    Workspace ws;
-    ws.owned_.resize(elems);
-    return ws;
+// The output shape, fitted to the rank the result type has.  A lower rank is
+// padded with leading extents of 1 -- which changes nothing about the elements,
+// only how they are described -- and a higher one cannot be represented at all.
+[[nodiscard]] constexpr result<Shape>
+fit_shape(const Shape &shape, const std::size_t rank) noexcept {
+  if (shape.size() > rank) {
+    return fail(errc::rank_mismatch);
   }
+  Shape fitted;
+  for (std::size_t i = shape.size(); i < rank; ++i) {
+    fitted.push_back(1);
+  }
+  for (const index_t extent : shape) {
+    fitted.push_back(extent);
+  }
+  return fitted;
+}
 
-  [[nodiscard]] static result<Workspace> borrow(const std::span<T> memory,
-                                                const std::size_t elems) noexcept {
-    if (memory.size() < elems) {
-      return fail(errc::workspace_too_small);
+// The one place a result is created.  Eigen sizes itself from the shape; a
+// nest resizes level by level; a std::array nest has its extents in its type
+// and can only check them.
+template <typename X>
+[[nodiscard]] result<X> make_like(const Shape &shape) noexcept;
+
+template <std::size_t D, std::size_t R, typename X>
+[[nodiscard]] constexpr result<void> shape_nest(X &x,
+                                                const Shape &shape) noexcept {
+  if constexpr (D == R) {
+    return {};
+  } else {
+    const auto want = static_cast<std::size_t>(shape[D]);
+    if constexpr (requires { x.resize(want); }) {
+      x.resize(want);
+    } else if (std::ranges::size(x) != want) {
+      // A std::array nest carries its extents in its type; the subscript has
+      // to agree with them rather than the other way round.
+      return fail(errc::output_mismatch);
     }
-    Workspace ws;
-    ws.borrowed_ = memory.first(elems);
-    ws.is_borrowed_ = true;
-    return ws;
+    for (auto &row : x) {
+      if (const auto ok = shape_nest<D + 1, R>(row, shape); !ok) {
+        return ok;
+      }
+    }
+    return {};
   }
+}
 
-  // Answered from the vector each time rather than cached, so moving a
-  // Workspace cannot leave a span pointing at the buffer it used to own.
-  [[nodiscard]] std::span<T> data() noexcept {
-    return is_borrowed_ ? borrowed_ : std::span<T>{owned_};
-  }
-
-private:
-  std::vector<T> owned_{};
-  std::span<T> borrowed_{};
-  bool is_borrowed_ = false;
-};
-
-// The one owned result.  Storage is std::array<T, N> on the compile-time path
-// and std::vector<T> on the runtime one, and that is the only difference
-// between them: same layout, same view, same accessors, one evaluate body
-// writing into the TensorView that view() answers.
-template <CScalar T, typename Storage> class Owned {
-public:
-  using value_type = T;
-
-  constexpr Owned() = default;
-  constexpr explicit Owned(const Layout &layout) noexcept : layout_{layout} {}
-
-  [[nodiscard]] static result<Owned> make(const Shape &shape)
-    requires requires(Storage s) { s.resize(std::size_t{}); }
-  {
-    Owned out{make_layout<RowMajor>(shape)};
-    out.data_.resize(static_cast<std::size_t>(out.layout_.size()));
+template <typename X>
+[[nodiscard]] result<X> make_like(const Shape &shape) noexcept {
+  using B = std::remove_cvref_t<X>;
+  if constexpr (CMdarray<B>) {
+    const auto fitted = fit_shape(shape, rank_v<B>);
+    if (!fitted) {
+      return propagate<X>(fitted.error());
+    }
+    if constexpr (rank_v<B> == 0) {
+      // A rank-0 mdarray holds one element and has no extents to be given.
+      return B{typename B::extents_type{}};
+    } else {
+      std::array<std::size_t, rank_v<B>> ext{};
+      std::ranges::transform(*fitted, ext.begin(),
+                             [](const index_t e) { return static_cast<std::size_t>(e); });
+      return B{typename B::extents_type{ext}};
+    }
+  } else if constexpr (CEigenTensor<B>) {
+    // A Tensor carries its rank in its type, so a shorter output shape is
+    // padded and a longer one has nowhere to go.
+    const auto fitted = fit_shape(shape, rank_v<B>);
+    if (!fitted) {
+      return propagate<X>(fitted.error());
+    }
+    typename B::Dimensions dims;
+    for (const auto i : std::views::iota(std::size_t{0}, rank_v<B>)) {
+      dims[i] = static_cast<typename B::Index>((*fitted)[i]);
+    }
+    B out(dims); // parentheses: braces would reach the variadic-extent ctor
+    out.setZero();
     return out;
-  }
-
-  [[nodiscard]] constexpr TensorView<T> view() noexcept { return {data_.data(), layout_}; }
-  [[nodiscard]] constexpr const Layout &layout() const noexcept { return layout_; }
-  [[nodiscard]] constexpr const Shape &shape() const noexcept { return layout_.shape; }
-  [[nodiscard]] constexpr const Storage &storage() const noexcept { return data_; }
-  [[nodiscard]] constexpr Storage take_storage() && noexcept { return std::move(data_); }
-
-  // The three ways to read it back, one per rung of the operand ladder.
-  [[nodiscard]] constexpr std::span<const T> as_span() const noexcept { return data_; }
-
-  // Row-major, and the subscript's rank rather than the matrix's: a rank-1
-  // result is a column and a rank-0 one is 1x1.
-  [[nodiscard]] result<Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic,
-                                                      Eigen::RowMajor>>>
-  as_matrix() const noexcept {
-    if (layout_.rank() > 2) {
-      return fail(errc::not_matrix);
-    }
-    const auto rows = static_cast<Eigen::Index>(layout_.rank() >= 1 ? layout_.shape[0] : 1);
-    const auto cols = static_cast<Eigen::Index>(layout_.rank() == 2 ? layout_.shape[1] : 1);
-    return Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>{
-        data_.data(), rows, cols};
-  }
-
-  // An mdspan's rank is in its type and a runtime subscript's is not, so the
-  // caller names the one they expect.
-  template <std::size_t R>
-  [[nodiscard]] result<std::mdspan<const T, std::dextents<std::size_t, R>>>
-  as_mdspan() const noexcept {
-    if (layout_.rank() != R) {
+  } else if constexpr (CEigenDense<B>) {
+    if (shape.size() > 2) {
       return fail(errc::rank_mismatch);
     }
-    std::array<std::size_t, R> extents{};
-    std::ranges::transform(layout_.shape, extents.begin(),
-                           [](const index_t e) { return static_cast<std::size_t>(e); });
-    return std::mdspan<const T, std::dextents<std::size_t, R>>{data_.data(), extents};
+    const auto rows =
+        static_cast<Eigen::Index>(shape.size() >= 1 ? shape[0] : 1);
+    const auto cols =
+        static_cast<Eigen::Index>(shape.size() == 2 ? shape[1] : 1);
+    // A fixed-size Eigen type cannot be resized into agreement; it can only be
+    // the right size already.
+    if constexpr (B::RowsAtCompileTime != Eigen::Dynamic) {
+      if (B::RowsAtCompileTime != rows) {
+        return fail(errc::output_mismatch);
+      }
+    }
+    if constexpr (B::ColsAtCompileTime != Eigen::Dynamic) {
+      if (B::ColsAtCompileTime != cols) {
+        return fail(errc::output_mismatch);
+      }
+    }
+    B out;
+    if constexpr (B::SizeAtCompileTime == Eigen::Dynamic) {
+      if constexpr (B::IsVectorAtCompileTime) {
+        out.resize(rows * cols);
+      } else {
+        out.resize(rows, cols);
+      }
+    }
+    out.setZero();
+    return out;
+  } else {
+    const auto fitted = fit_shape(shape, rank_v<B>);
+    if (!fitted) {
+      return propagate<X>(fitted.error());
+    }
+    B out{};
+    return shape_nest<0, rank_v<B>>(out, *fitted).transform([&] noexcept {
+      return std::move(out);
+    });
   }
+}
 
-private:
-  Storage data_{};
-  Layout layout_{};
+} // namespace impl
+
+namespace impl {
+
+// A nest of std::vector R deep over T; R == 0 is the scalar itself.
+template <typename T, std::size_t R> struct nest_of {
+  using type = std::vector<typename nest_of<T, R - 1>::type>;
 };
+template <typename T> struct nest_of<T, 0> {
+  using type = T;
+};
+template <typename T, std::size_t R>
+using nest_of_t = typename nest_of<T, R>::type;
 
-template <CScalar T> using OwnedBuffer = Owned<T, std::vector<T>>;
-template <CScalar T, std::size_t N> using OwnedArray = Owned<T, std::array<T, N>>;
+} // namespace impl
 
-// Which accessor "the same kind as the inputs" means.  Each one hands back
-// something that owns its elements: a Map or a span into a buffer the call is
-// about to drop would dangle, so only the mdspan rung -- whose rank is not in
-// any type a runtime subscript could name -- returns the buffer itself.
-template <OperandKind K> struct result_for;
+// The result type of a call over these operands.  It is fixed by the operand
+// types alone, because on the runtime path the subscript is not a type and the
+// return type still has to be one -- so the rank is the widest operand's and
+// the true output shape is fitted to it: a lower rank is padded with leading
+// extents of 1, and a higher one is a rank_mismatch the `out&` form can name
+// its way out of.
+//
+// Eigen answers an Eigen matrix in the first operand's storage order (rank 0,
+// 1 and 2 being 1x1, Nx1 and MxN by Eigen's own convention); the other two
+// families answer a nest of vectors, because a view cannot own a result and a
+// nest already is one.
+namespace impl {
 
-// The one copy in the library, and it cannot be avoided: an Eigen::Matrix owns
-// its elements through its own allocator and has no way to adopt a buffer, so
-// handing back a Matrix means copying into one.  The alternative -- returning a
-// Map into the buffer -- would dangle the moment the call returned.
-template <> struct result_for<OperandKind::eigen> {
-  [[nodiscard]] static auto get(auto &&owned) {
-    using T = typename std::remove_cvref_t<decltype(owned)>::value_type;
-    using Matrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic>;
-    return owned.as_matrix().transform([](const auto &m) { return Matrix{m}; });
+template <typename X>
+inline constexpr int eigen_order_of =
+    std::remove_cvref_t<X>::IsRowMajor ? Eigen::RowMajor : Eigen::ColMajor;
+
+template <typename... Ops>
+[[nodiscard]] consteval auto result_probe() noexcept {
+  using First = std::remove_cvref_t<first_of_t<Ops...>>;
+  using T = scalar_of_t<First>;
+  constexpr std::size_t kRank = widest_rank_v<Ops...>;
+  if constexpr (CEigenFamily<First>) {
+    return std::type_identity<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic,
+                                            eigen_order_of<First>>>{};
+  } else if constexpr (CTensorFamily<First>) {
+    // A Tensor's rank is in its type, and that type cannot be rebuilt here
+    // without naming Eigen's Tensor header, so the result is the widest operand
+    // itself.  An output deeper than that is rank_mismatch, as for array nests.
+    return std::type_identity<widest_of_t<Ops...>>{};
+  } else if constexpr (CNestFamily<First> &&
+                       rank_v<widest_of_t<Ops...>> == kRank) {
+    // A nest that is already the right depth answers its own type, which is
+    // what makes an einsum over std::array nests give back a std::array nest.
+    return std::type_identity<widest_of_t<Ops...>>{};
+  } else {
+    // A view cannot own a result, and a nest shallower than the output needs a
+    // deeper one than it is; both answer the vector nest of that rank.
+    return std::type_identity<nest_of_t<T, kRank>>{};
   }
-};
+}
 
-template <> struct result_for<OperandKind::mdspan> {
-  [[nodiscard]] static auto get(auto &&owned) {
-    return result<std::remove_cvref_t<decltype(owned)>>{std::forward<decltype(owned)>(owned)};
-  }
-};
+} // namespace impl
 
-// Moved, not copied: the buffer already is the std::vector the caller asked for.
-template <> struct result_for<OperandKind::flat> {
-  [[nodiscard]] static auto get(auto &&owned) {
-    using T = typename std::remove_cvref_t<decltype(owned)>::value_type;
-    return result<std::vector<T>>{std::forward<decltype(owned)>(owned).take_storage()};
-  }
-};
+template <typename... Ops>
+  requires CSameFamily<Ops...>
+using result_of_t = typename decltype(impl::result_probe<Ops...>())::type;
 
 } // namespace einsum

@@ -45,20 +45,22 @@ target_sources(einsum INTERFACE
         BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/include
         FILES
         include/einsum/einsum.hpp
+        include/einsum/util/concepts.hpp
         include/einsum/util/error.hpp
         include/einsum/util/export.hpp
         include/einsum/util/fixed_string.hpp
         include/einsum/util/fixed_vec.hpp
         include/einsum/util/ranges.hpp
-        include/einsum/core/bound.hpp
+        include/einsum/core/einsum_object.hpp
         include/einsum/core/execute.hpp
         include/einsum/core/kernels.hpp
         include/einsum/core/limits.hpp
         include/einsum/core/lower.hpp
+        include/einsum/core/owned.hpp
         include/einsum/core/plan.hpp
         include/einsum/core/view.hpp
         include/einsum/ct/einsum.hpp
-        include/einsum/ct/labels.hpp
+        include/einsum/ct/static_shape.hpp
         include/einsum/ct/subscripts.hpp
         include/einsum/rt/parse.hpp)
 

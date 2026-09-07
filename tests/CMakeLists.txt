@@ -34,11 +34,11 @@ set(EINSUM_COMPILE_FAIL_CASES
         compile_fail_bad_subscript
         "the subscript has a character this grammar does not accept"
         compile_fail_extent_conflict
-        "one label is bound to two different extents"
+        "the output repeats a label"
         compile_fail_operand_count
         "the subscript names a different number of operands than the call passes"
         compile_fail_mixed_kinds
-        "every operand must be the same kind")
+        "must be one family and one scalar")
 
 list(LENGTH EINSUM_COMPILE_FAIL_CASES _einsum_case_count)
 math(EXPR _einsum_last "${_einsum_case_count} - 1")

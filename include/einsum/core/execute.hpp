@@ -19,8 +19,8 @@ namespace einsum::impl {
 // caller's own.
 template <CScalar T>
 void execute(const Plan &plan, const Geometry &geom,
-             const std::span<const TensorView<const T>> views, const TensorView<T> &out,
-             const std::span<T> scratch) noexcept {
+             const std::span<const TensorView<const T>> views,
+             const TensorView<T> &out, const std::span<T> scratch) noexcept {
   for (const auto &[view, pg] : std::views::zip(views, geom.preps)) {
     if (pg.reduced) {
       ReduceKernel::run<T>(pg, view.data, scratch.data() + pg.reduced_offset);
@@ -28,17 +28,20 @@ void execute(const Plan &plan, const Geometry &geom,
   }
 
   if (plan.operand_count() == 1) {
-    const T *src = geom.unary_from_scratch ? scratch.data() + geom.unary_offset : views[0].data;
+    const T *src = geom.unary_from_scratch ? scratch.data() + geom.unary_offset
+                                           : views[0].data;
     PermuteKernel::run<T>(out, src, geom.unary_src);
     return;
   }
 
   for (const StepGeom &sg : geom.steps) {
-    const T *left = sg.l_scratch ? scratch.data() + sg.l_offset : views[sg.l_operand].data;
-    const T *right = sg.r_scratch ? scratch.data() + sg.r_offset : views[sg.r_operand].data;
+    const T *left =
+        sg.l_scratch ? scratch.data() + sg.l_offset : views[sg.l_operand].data;
+    const T *right =
+        sg.r_scratch ? scratch.data() + sg.r_offset : views[sg.r_operand].data;
     T *dst = sg.out_scratch ? scratch.data() + sg.out_offset : out.data;
     // The Geometry chose the strategy; this is only where it is applied.
-    if (sg.hadamard) {
+    if (sg.hadamard()) {
       HadamardKernel::run<T>(sg, left, right, dst, scratch.data());
     } else {
       GemmKernel::run<T>(sg, left, right, dst, scratch.data());

@@ -1,5 +1,6 @@
 #include "einsum/rt/parse.hpp"
 
+#include "einsum/core/einsum_object.hpp"
 #include "einsum/core/limits.hpp"
 #include "einsum/core/plan.hpp"
 #include "einsum/ct/subscripts.hpp"
@@ -18,8 +19,9 @@
 // Everything this file decides that is not the shape of the text -- the
 // ellipsis refusal, the implicit output, the explicit output's validity -- it
 // decides by calling the same helpers impl::parse_subscripts does, so the two
-// front ends cannot drift apart.  tests/tests_parse.cpp checks that they have not.
-namespace einsum::rt {
+// front ends cannot drift apart.  tests/tests_parse.cpp checks that they have
+// not.
+namespace einsum {
 namespace {
 
 namespace bp = boost::parser;
@@ -38,15 +40,16 @@ using bp::_pass;
 // parse failed and leaves the errc to say what about it did.
 struct Silent {
   template <typename Iter, typename Sentinel>
-  constexpr bp::error_handler_result operator()(Iter, Sentinel,
-                                                const bp::parse_error<Iter> &) const {
+  constexpr bp::error_handler_result
+  operator()(Iter, Sentinel, const bp::parse_error<Iter> &) const {
     return bp::error_handler_result::fail;
   }
   template <typename Context>
-  constexpr void diagnose(bp::diagnostic_kind, std::string_view, const Context &) const {}
+  constexpr void diagnose(bp::diagnostic_kind, std::string_view,
+                          const Context &) const {}
   template <typename Context, typename Iter>
-  constexpr void diagnose(bp::diagnostic_kind, std::string_view, const Context &,
-                          Iter) const {}
+  constexpr void diagnose(bp::diagnostic_kind, std::string_view,
+                          const Context &, Iter) const {}
 };
 
 // What the actions build.  Carried through with_globals rather than captured:
@@ -73,7 +76,8 @@ namespace act {
 // was handed rather than about the one that actually went wrong: a ninth
 // operand refused as too_many_operands must not be re-reported as an empty one
 // by the eps that follows it.
-template <errc C> constexpr auto refuse = [](auto &ctx) {
+template <errc C>
+constexpr auto refuse = [](auto &ctx) {
   Building &building = _globals(ctx);
   if (!building.refused) {
     building.why = C;
@@ -85,14 +89,14 @@ template <errc C> constexpr auto refuse = [](auto &ctx) {
 constexpr auto push_label = [](auto &ctx) {
   Building &building = _globals(ctx);
   Labels &target = building.in_output ? building.subs.output : building.current;
-  if (!target.push_back(_attr(ctx))) {
+  if (!target.try_push_back(_attr(ctx))) {
     refuse<errc::rank_too_high>(ctx);
   }
 };
 
 constexpr auto end_operand = [](auto &ctx) {
   Building &building = _globals(ctx);
-  if (!building.subs.operands.push_back(building.current)) {
+  if (!building.subs.operands.try_push_back(building.current)) {
     refuse<errc::too_many_operands>(ctx);
     return;
   }
@@ -110,7 +114,8 @@ constexpr auto begin_output = [](auto &ctx) {
 
 // --- the grammar -------------------------------------------------------------
 // Rules carry no attribute: the actions above write into the globals, and there
-// is nothing left for Boost.Parser to synthesize or for a merge rule to reshape.
+// is nothing left for Boost.Parser to synthesize or for a merge rule to
+// reshape.
 bp::rule<struct label_tag> const label = "label";
 bp::rule<struct operand_tag> const operand = "operand";
 bp::rule<struct ellipsis_tag> const ellipsis = "ellipsis";
@@ -122,10 +127,13 @@ constexpr auto letter = bp::char_('a', 'z') | bp::char_('A', 'Z');
 
 auto const label_def = letter[act::push_label];
 auto const operand_def = +label;
-auto const ellipsis_def = bp::lit("...")[act::refuse<errc::ellipsis_unsupported>];
+auto const ellipsis_def =
+    bp::lit("...")[act::refuse<errc::ellipsis_unsupported>];
 // eps after operand: a comma with nothing between it and the next one is an
 // empty operand, which is a different complaint from "this is not a subscript".
-auto const inputs_def = (operand[act::end_operand] | bp::eps[act::refuse<errc::empty_operand>]) % ',';
+auto const inputs_def =
+    (operand[act::end_operand] | bp::eps[act::refuse<errc::empty_operand>]) %
+    ',';
 auto const output_def = bp::lit("->")[act::begin_output] >> *label;
 auto const subscript_def = inputs >> -(ellipsis | output) >> bp::eoi;
 
@@ -133,7 +141,7 @@ BOOST_PARSER_DEFINE_RULES(label, operand, ellipsis, inputs, output, subscript);
 
 } // namespace
 
-result<Subscripts> parse(const std::string_view source) noexcept {
+result<Subscripts> parse_subscript(const std::string_view source) noexcept {
   if (const auto ok = impl::precheck(source); !ok) {
     return std::unexpected{ok.error()};
   }
@@ -144,9 +152,10 @@ result<Subscripts> parse(const std::string_view source) noexcept {
   const Silent quiet;
   const bool ok = [&]() noexcept {
     try {
-      return bp::parse(source,
-                       bp::with_error_handler(bp::with_globals(subscript, building), quiet),
-                       bp::ws);
+      return bp::parse(
+          source,
+          bp::with_error_handler(bp::with_globals(subscript, building), quiet),
+          bp::ws);
     } catch (...) {
       return false;
     }
@@ -158,8 +167,12 @@ result<Subscripts> parse(const std::string_view source) noexcept {
   return impl::finish_subscripts(building.subs);
 }
 
-result<Plan> plan(const std::string_view source) noexcept {
-  return parse(source).and_then(impl::make_plan);
+result<Einsum> einsum(const std::string_view source) {
+  return parse_subscript(source)
+      .and_then(impl::make_plan)
+      .transform([](Plan &&plan) {
+        return impl::einsum_access::make<impl::HeapScratch>(std::move(plan));
+      });
 }
 
-} // namespace einsum::rt
+} // namespace einsum

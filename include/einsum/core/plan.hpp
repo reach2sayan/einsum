@@ -3,7 +3,9 @@
 #include "einsum/core/limits.hpp"
 #include "einsum/ct/subscripts.hpp"
 #include "einsum/util/error.hpp"
+#include "einsum/util/ranges.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <ranges>
@@ -26,8 +28,8 @@ struct Prep {
   // merged_labels minus reduce: what the steps actually see.
   Labels labels_after{};
 
-  [[nodiscard]] friend constexpr bool operator==(const Prep &,
-                                                 const Prep &) noexcept = default;
+  [[nodiscard]] friend constexpr bool
+  operator==(const Prep &, const Prep &) noexcept = default;
 };
 
 // One binary contraction, named by which labels play which role in it.  batch
@@ -42,14 +44,19 @@ struct Step {
   Labels target{}; // batch ++ m ++ n, the labels of what this step produces
   bool writes_output = false;
 
-  [[nodiscard]] friend constexpr bool operator==(const Step &,
-                                                 const Step &) noexcept = default;
+  [[nodiscard]] friend constexpr bool
+  operator==(const Step &, const Step &) noexcept = default;
 };
 
 class Plan;
 
 namespace impl {
 [[nodiscard]] constexpr result<Plan> make_plan(const Subscripts &) noexcept;
+
+// The one way the lowering reads a Plan's internals.  A friend struct rather
+// than a public accessor per member: preps and steps are what make_geometry
+// walks and are no part of what a caller of einsum() ever asks about.
+struct access;
 } // namespace impl
 
 // A parsed, lowered einsum: extent-free, allocation-free, a value type.  It is
@@ -59,33 +66,21 @@ class Plan {
 public:
   constexpr Plan() noexcept = default;
 
-  [[nodiscard]] constexpr const Subscripts &subscripts() const noexcept { return subs_; }
+  [[nodiscard]] constexpr const Subscripts &subscripts() const noexcept {
+    return subs_;
+  }
   [[nodiscard]] constexpr std::size_t operand_count() const noexcept {
     return subs_.operands.size();
   }
   [[nodiscard]] constexpr const Labels &output_labels() const noexcept {
     return subs_.output;
   }
-  [[nodiscard]] constexpr const impl::FixedVec<Prep, kMaxOperands> &preps() const noexcept {
-    return preps_;
-  }
-  [[nodiscard]] constexpr const impl::FixedVec<Step, kMaxOperands - 1> &
-  steps() const noexcept {
-    return steps_;
-  }
-
-  [[nodiscard]] friend constexpr bool operator==(const Plan &,
-                                                 const Plan &) noexcept = default;
-
-  // Defined in core/bound.hpp, which is where Bound<T> becomes a complete type.
-  // Templates, so nothing is instantiated until a caller names one.
-  template <typename... A> [[nodiscard]] auto bind(A &&...args) const;
-  template <typename... A> [[nodiscard]] auto operator()(A &&...args) const;
-  template <typename... A> [[nodiscard]] auto eval(A &&...args) const;
-  template <typename... A> [[nodiscard]] auto to_matrix(A &&...args) const;
+  [[nodiscard]] friend constexpr bool
+  operator==(const Plan &, const Plan &) noexcept = default;
 
 private:
   friend constexpr result<Plan> impl::make_plan(const Subscripts &) noexcept;
+  friend struct impl::access;
 
   Subscripts subs_{};
   impl::FixedVec<Prep, kMaxOperands> preps_{};
@@ -94,25 +89,37 @@ private:
 
 namespace impl {
 
+struct access {
+  [[nodiscard]] static constexpr const FixedVec<Prep, kMaxOperands> &
+  preps(const Plan &plan) noexcept {
+    return plan.preps_;
+  }
+  [[nodiscard]] static constexpr const FixedVec<Step, kMaxOperands - 1> &
+  steps(const Plan &plan) noexcept {
+    return plan.steps_;
+  }
+};
+
 [[nodiscard]] constexpr result<Prep>
 make_prep(const Labels &operand, const Labels &output,
           const LabelTable<std::uint8_t> &counts) noexcept {
   Prep prep;
   for (const char c : operand) {
-    const std::size_t at = prep.merged_labels.index_of(c);
-    if (at == prep.merged_labels.size() && !prep.merged_labels.push_back(c)) {
+    const std::size_t at = index_of(prep.merged_labels, c);
+    if (at == prep.merged_labels.size() &&
+        !prep.merged_labels.try_push_back(c)) {
       return fail(errc::rank_too_high);
     }
-    if (!prep.merged_into.push_back(static_cast<std::uint8_t>(at))) {
+    if (!prep.merged_into.try_push_back(static_cast<std::uint8_t>(at))) {
       return fail(errc::rank_too_high);
     }
   }
   for (const char c : prep.merged_labels) {
     const bool nobody_else = counts[c] == 1;
-    if (nobody_else && !output.contains(c)) {
-      (void)prep.reduce.push_back(c);
+    if (nobody_else && !std::ranges::contains(output, c)) {
+      prep.reduce.push_back(c);
     } else {
-      (void)prep.labels_after.push_back(c);
+      prep.labels_after.push_back(c);
     }
   }
   return prep;
@@ -134,7 +141,7 @@ make_plan(const Subscripts &subs) noexcept {
     if (!prep) {
       return std::unexpected{prep.error()};
     }
-    (void)plan.preps_.push_back(*prep);
+    plan.preps_.push_back(*prep);
   }
 
   const std::size_t n = plan.preps_.size();
@@ -146,40 +153,41 @@ make_plan(const Subscripts &subs) noexcept {
     // A label is needed past this step if the output wants it or a later
     // operand still has to meet it; anything else is what k means.
     const auto needed = [&](const char c) noexcept {
-      if (subs.output.contains(c)) {
+      if (std::ranges::contains(subs.output, c)) {
         return true;
       }
       return std::ranges::any_of(
-          std::views::iota(i + 1, n),
-          [&](const std::size_t j) { return plan.preps_[j].labels_after.contains(c); });
+          std::views::iota(i + 1, n), [&](const std::size_t j) {
+            return std::ranges::contains(plan.preps_[j].labels_after, c);
+          });
     };
 
     Step step;
     for (const char c : left) {
-      const bool shared = right.contains(c);
+      const bool shared = std::ranges::contains(right, c);
       auto &group = shared ? (needed(c) ? step.batch : step.k) : step.m;
-      if (!group.push_back(c)) {
+      if (!group.try_push_back(c)) {
         return fail(errc::rank_too_high);
       }
     }
     // Right-only labels are all free: one that nothing later wants would have
     // been summed away by make_prep, since only this operand could have it.
     for (const char c : right) {
-      if (!left.contains(c) && !step.n.push_back(c)) {
+      if (!std::ranges::contains(left, c) && !step.n.try_push_back(c)) {
         return fail(errc::rank_too_high);
       }
     }
 
     for (const Labels *group : {&step.batch, &step.m, &step.n}) {
       for (const char c : *group) {
-        if (!step.target.push_back(c)) {
+        if (!step.target.try_push_back(c)) {
           return fail(errc::rank_too_high);
         }
       }
     }
     step.writes_output = (i + 1 == n);
     left = step.target;
-    (void)plan.steps_.push_back(step);
+    plan.steps_.push_back(step);
   }
 
   return plan;
@@ -188,7 +196,8 @@ make_plan(const Subscripts &subs) noexcept {
 // parse -> plan, as one pipeline both front ends run.  ct::subscripts<S> calls
 // it in a constant expression and rt::plan() calls it after Boost.Parser has
 // produced the same Subscripts, so the two paths differ only in the parser.
-[[nodiscard]] constexpr result<Plan> build_plan(const std::string_view source) noexcept {
+[[nodiscard]] constexpr result<Plan>
+build_plan(const std::string_view source) noexcept {
   return parse_subscripts(source).and_then(make_plan);
 }
 

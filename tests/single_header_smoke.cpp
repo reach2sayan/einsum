@@ -6,17 +6,14 @@
 #include <vector>
 
 int main() {
-  std::vector A{0, 1, 2, 3, 4, 5};
-  std::vector B{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
-  std::mdspan<int, std::extents<std::size_t, 2, 3>> a{A.data()};
-  std::mdspan<int, std::extents<std::size_t, 3, 4>> b{B.data()};
+  const std::vector<std::vector<int>> a{{0, 1, 2}, {3, 4, 5}};
+  const std::vector<std::vector<int>> b{
+      {1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
 
-  auto ein = einsum::einsum<"ij,jk->ik">(a, b);
-  ein.eval();
+  const auto ct = einsum::einsum<"ij,jk->ik">()(a, b);
 
-  // The runtime lowering is header-only too; only rt::plan() needs the library.
-  const auto plan = einsum::impl::build_plan("ij,jk->ik");
-  std::vector<int> out(8);
-  const auto ok = plan->eval(a, b, einsum::into(out, {2, 4}));
-  return ein.get_result()[0] + (ok.has_value() ? 0 : 1);
+  // einsum(std::string_view) is the only part that needs the library linked, so
+  // the header on its own is exercised through the compile-time form.
+  const auto other = einsum::einsum<"ij,jk">()(a, b);
+  return (*ct)[0][0] + (other.has_value() ? 0 : 1);
 }

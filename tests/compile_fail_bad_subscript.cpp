@@ -5,9 +5,7 @@
 #include <vector>
 
 int main() {
-  std::vector A{1, 2, 3, 4};
-  std::mdspan<int, std::extents<std::size_t, 2, 2>> a{A.data()};
-  auto ein = einsum::einsum<"i1,jk->ik">(a, a);
-  ein.eval();
-  return ein.get_result()[0];
+  const std::vector<std::vector<int>> a{{1, 2}, {3, 4}};
+  const auto out = einsum::einsum<"i1,jk->ik">()(a, a);
+  return (*out)[0][0];
 }

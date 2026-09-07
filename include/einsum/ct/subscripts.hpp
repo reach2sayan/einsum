@@ -3,6 +3,7 @@
 #include "einsum/core/limits.hpp"
 #include "einsum/util/error.hpp"
 #include "einsum/util/fixed_string.hpp"
+#include "einsum/util/ranges.hpp"
 
 #include <algorithm>
 #include <array>
@@ -20,8 +21,8 @@ struct Subscripts {
   Labels output{};
   bool explicit_output = false;
 
-  [[nodiscard]] friend constexpr bool operator==(const Subscripts &,
-                                                 const Subscripts &) noexcept = default;
+  [[nodiscard]] friend constexpr bool
+  operator==(const Subscripts &, const Subscripts &) noexcept = default;
 };
 
 namespace impl {
@@ -32,7 +33,7 @@ namespace impl {
 
 // How often each label appears.  once_per_operand counts a repeat inside one
 // operand as one occurrence, which is what "does anybody else have this label"
-// means; counting every occurrence is what an implicit output needs.  Saturating
+// means; counting every occurrence is what an implicit output needs. Saturating
 // at two, because two occurrences and twenty mean the same thing to both
 // callers.
 [[nodiscard]] constexpr LabelTable<std::uint8_t>
@@ -40,11 +41,13 @@ count_labels(const FixedVec<Labels, kMaxOperands> &operands,
              const bool once_per_operand) noexcept {
   LabelTable<std::uint8_t> counts;
   for (const Labels &op : operands) {
-    for (const auto a : std::views::iota(std::size_t{0}, op.size())) {
-      if (once_per_operand && op.index_of(op[a]) != a) {
+    // enumerate, because "is this the first time this operand says c" is a
+    // question about the position as well as the character.
+    for (const auto [a, c] : op | std::views::enumerate) {
+      if (once_per_operand && index_of(op, c) != static_cast<std::size_t>(a)) {
         continue;
       }
-      std::uint8_t &n = counts[op[a]];
+      std::uint8_t &n = counts[c];
       n = static_cast<std::uint8_t>(n < 2 ? n + 1 : n);
     }
   }
@@ -60,37 +63,39 @@ implicit_output(const FixedVec<Labels, kMaxOperands> &operands) noexcept {
   Labels out;
   // kLabelChars, not the table's own slot order: the output is sorted by
   // character, and 'Z' sorts before 'a'.
-  for (const char c : kLabelChars) {
-    // Cannot overflow: a label occurring once is one of at most kMaxRank
-    // distinct ones per operand.  Checked anyway.
-    if (seen[c] == 1 && !out.push_back(c)) {
+  auto once = kLabelChars | std::views::filter(
+                                [&seen](const char c) { return seen[c] == 1; });
+  // Cannot overflow: a label occurring once is one of at most kMaxRank distinct
+  // ones per operand.  Checked anyway.
+  for (const char c : once) {
+    if (!out.try_push_back(c)) {
       return out;
     }
   }
   return out;
 }
 
-// What neither parser needs a grammar to see.  Shared so the two front ends
-// cannot drift: a '.' anywhere means the same refusal whichever one read it,
-// and so does a subscript that is only whitespace.
-[[nodiscard]] constexpr result<void> precheck(const std::string_view source) noexcept {
-  bool any = false;
-  for (const char c : source) {
-    if (c == '.') {
-      return fail(errc::ellipsis_unsupported);
-    }
-    any = any || (c != ' ' && c != '\t');
+// What neither parser needs a grammar to see.
+[[nodiscard]] constexpr result<void>
+precheck(const std::string_view source) noexcept {
+  if (std::ranges::contains(source, '.')) {
+    return fail(errc::ellipsis_unsupported);
   }
-  return any ? result<void>{} : fail(errc::no_operands);
+  const auto blank = [](const char c) noexcept {
+    return c == ' ' || c == '\t';
+  };
+  return std::ranges::all_of(source, blank) ? fail(errc::no_operands)
+                                            : result<void>{};
 }
 
 // An explicit output has to name labels that exist, and name each one once.
 [[nodiscard]] constexpr result<void>
 validate_output(const Subscripts &subs) noexcept {
-  for (const auto i : std::views::iota(std::size_t{0}, subs.output.size())) {
-    const char c = subs.output[i];
-    const bool known = std::ranges::any_of(
-        subs.operands, [c](const Labels &op) { return op.contains(c); });
+  for (const char c : subs.output) {
+    const bool known =
+        std::ranges::any_of(subs.operands, [c](const Labels &op) {
+          return std::ranges::contains(op, c);
+        });
     if (!known) {
       return fail(errc::unknown_output_label);
     }
@@ -102,9 +107,9 @@ validate_output(const Subscripts &subs) noexcept {
 }
 
 // The last step of either parser: an explicit output is checked, an absent one
-// is inferred.  Shared, so "ij,jk" means the same thing whichever front end
-// read it.
-[[nodiscard]] constexpr result<Subscripts> finish_subscripts(Subscripts subs) noexcept {
+// is inferred.
+[[nodiscard]] constexpr result<Subscripts>
+finish_subscripts(Subscripts subs) noexcept {
   if (subs.operands.empty()) {
     return fail(errc::no_operands);
   }
@@ -115,10 +120,6 @@ validate_output(const Subscripts &subs) noexcept {
   return validate_output(subs).transform([&] noexcept { return subs; });
 }
 
-// One pass, no allocation, usable in a constant expression -- which is what
-// lets einsum<"..."> report a bad subscript as a static_assert rather than as
-// a template backtrace.  The grammar it accepts is the one src/rt/parse.cpp
-// spells out in Boost.Parser, and tests/tests_parse.cpp holds them to it.
 [[nodiscard]] constexpr result<Subscripts>
 parse_subscripts(const std::string_view source) noexcept {
   if (const auto ok = precheck(source); !ok) {
@@ -141,7 +142,7 @@ parse_subscripts(const std::string_view source) noexcept {
       if (current.empty()) {
         return fail(errc::empty_operand);
       }
-      if (!subs.operands.push_back(current)) {
+      if (!subs.operands.try_push_back(current)) {
         return fail(errc::too_many_operands);
       }
       current.clear();
@@ -157,7 +158,7 @@ parse_subscripts(const std::string_view source) noexcept {
       if (current.empty()) {
         return fail(errc::empty_operand);
       }
-      if (!subs.operands.push_back(current)) {
+      if (!subs.operands.try_push_back(current)) {
         return fail(errc::too_many_operands);
       }
       current.clear();
@@ -167,7 +168,7 @@ parse_subscripts(const std::string_view source) noexcept {
       return fail(errc::bad_syntax);
     }
     Labels &target = in_output ? subs.output : current;
-    if (!target.push_back(c)) {
+    if (!target.try_push_back(c)) {
       return fail(errc::rank_too_high);
     }
   }
@@ -176,7 +177,7 @@ parse_subscripts(const std::string_view source) noexcept {
     if (current.empty()) {
       return fail(errc::empty_operand); // a trailing comma
     }
-    if (!subs.operands.push_back(current)) {
+    if (!subs.operands.try_push_back(current)) {
       return fail(errc::too_many_operands);
     }
   }
@@ -196,9 +197,6 @@ template <impl::FixedString S> struct subscripts {
   EINSUM_ASSERT_NO_ERROR(EINSUM_SUBSCRIPT_FAILED)
 #undef EINSUM_SUBSCRIPT_FAILED
 
-  // value_or, not value(): the asserts above have already said what went wrong,
-  // and .value() on a failed expected in a constant expression says it again in
-  // the language's own words.
   static constexpr Subscripts value = parsed.value_or(Subscripts{});
 };
 

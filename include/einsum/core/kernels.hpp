@@ -1,14 +1,15 @@
 #pragma once
 
 #include "einsum/core/lower.hpp"
-#include "einsum/core/odometer.hpp"
+#include "einsum/core/view.hpp"
 #include "einsum/util/concepts.hpp"
+#include "einsum/util/ranges.hpp"
 
 #include <Eigen/Core>
 
 #include <algorithm>
-#include <ranges>
 #include <cstdint>
+#include <ranges>
 #include <type_traits>
 
 // The only place Eigen is called.  Everything above builds descriptions; each
@@ -24,40 +25,62 @@ namespace einsum::impl {
 // see is 1, and evaluates it into a heap temporary instead.  A column-major map
 // is how a transposed block keeps that property without a Transpose expression.
 template <CScalar T>
-using RowMap = Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
-                          Eigen::Unaligned, Eigen::OuterStride<>>;
+using RowMap = Eigen::Map<
+    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
+    Eigen::Unaligned, Eigen::OuterStride<>>;
 template <CScalar T>
-using CRowMap = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
-                           Eigen::Unaligned, Eigen::OuterStride<>>;
+using CRowMap = Eigen::Map<
+    const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
+    Eigen::Unaligned, Eigen::OuterStride<>>;
 template <CScalar T>
-using ColMap = Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>,
-                          Eigen::Unaligned, Eigen::OuterStride<>>;
+using ColMap = Eigen::Map<
+    Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>,
+    Eigen::Unaligned, Eigen::OuterStride<>>;
 template <CScalar T>
-using CColMap = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>,
-                           Eigen::Unaligned, Eigen::OuterStride<>>;
+using CColMap = Eigen::Map<
+    const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>,
+    Eigen::Unaligned, Eigen::OuterStride<>>;
 
 template <CScalar T>
-using VecMap =
-    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>, Eigen::Unaligned, Eigen::InnerStride<>>;
+using VecMap = Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>, Eigen::Unaligned,
+                          Eigen::InnerStride<>>;
 template <CScalar T>
-using CVecMap =
-    Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>, Eigen::Unaligned, Eigen::InnerStride<>>;
+using CVecMap = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>,
+                           Eigen::Unaligned, Eigen::InnerStride<>>;
 
-// The compile-time fast path's map: every extent in the type, so the product is
-// unrolled rather than blocked.
-template <CScalar T, index_t R, index_t C>
+// The compile-time fast path's maps: every extent in the type, so the product
+// is unrolled rather than blocked.  The storage order is a parameter because an
+// operand keeps its own -- a column-major A times a column-major B into a
+// column-major C is a plain fixed product, and forcing row-major on it would
+// mean transposing three matrices to no purpose.
+//
+// A single column has to be column-major and a single row row-major, whatever
+// the operand's own order says; Eigen refuses the other pairing.
+[[nodiscard]] consteval int fixed_order(const index_t rows, const index_t cols,
+                                        const bool row_major) noexcept {
+  if (cols == 1) {
+    return Eigen::ColMajor;
+  }
+  if (rows == 1) {
+    return Eigen::RowMajor;
+  }
+  return row_major ? Eigen::RowMajor : Eigen::ColMajor;
+}
+
+template <CScalar T, index_t R, index_t C, bool RowOrder>
 using CFixedMap =
     Eigen::Map<const Eigen::Matrix<T, static_cast<int>(R), static_cast<int>(C),
-                                   (C == 1 ? Eigen::ColMajor : Eigen::RowMajor)>>;
-template <CScalar T, index_t R, index_t C>
-using FixedMap = Eigen::Map<Eigen::Matrix<T, static_cast<int>(R), static_cast<int>(C),
-                                          (C == 1 ? Eigen::ColMajor : Eigen::RowMajor)>>;
+                                   fixed_order(R, C, RowOrder)>>;
+template <CScalar T, index_t R, index_t C, bool RowOrder>
+using FixedMap =
+    Eigen::Map<Eigen::Matrix<T, static_cast<int>(R), static_cast<int>(C),
+                             fixed_order(R, C, RowOrder)>>;
 
 // --- gathering ---------------------------------------------------------------
 // A rectangle Eigen cannot address becomes one it can: rows x cols, row-major,
 // contiguous.  scatter() is the same journey back, for an output whose strides
-// Eigen could not write to.  One body, parameterised on which side is strided --
-// the two differ only in that.
+// Eigen could not write to.  One body, parameterised on which side is strided
+// -- the two differ only in that.
 enum class Direction : std::uint8_t { gather, disperse };
 
 // Constness follows the direction, so neither call site needs a cast; T is not
@@ -68,32 +91,38 @@ template <Direction D, CScalar T>
 using StridedPtr = std::conditional_t<D == Direction::gather, const T *, T *>;
 
 template <Direction D, CScalar T>
-void shuffle(PackedPtr<D, T> packed, StridedPtr<D, T> strided, const Layout &rows,
-             const Layout &cols, const index_t rows_n, const index_t cols_n) noexcept {
+void shuffle(PackedPtr<D, T> packed, StridedPtr<D, T> strided,
+             const Layout &rows, const Layout &cols) noexcept {
   const Collapsed run = collapse(cols);
-  Odometer row{rows};
-  for (index_t r = 0; r < rows_n; ++r, ++row) {
-    auto *line = strided + row.offset();
-    auto *flat = packed + r * cols_n;
-    if (run.ok) {
-      if constexpr (D == Direction::gather) {
-        VecMap<T>{flat, cols_n, Eigen::InnerStride<>{1}} =
-            CVecMap<T>{line, cols_n, Eigen::InnerStride<>{run.stride}};
-      } else {
-        VecMap<T>{line, cols_n, Eigen::InnerStride<>{run.stride}} =
-            CVecMap<T>{flat, cols_n, Eigen::InnerStride<>{1}};
-      }
-    } else {
-      Odometer col{cols};
-      for (index_t c = 0; c < cols_n; ++c, ++col) {
-        if constexpr (D == Direction::gather) {
-          flat[c] = line[col.offset()];
+  const index_t cols_n = cols.size();
+  index_t r = 0;
+  for_each_offset(
+      [&](const index_t row_offset) noexcept {
+        auto *line = strided + row_offset;
+        auto *flat = packed + r++ * cols_n;
+        if (run.ok) {
+          if constexpr (D == Direction::gather) {
+            VecMap<T>{flat, cols_n, Eigen::InnerStride<>{1}} =
+                CVecMap<T>{line, cols_n, Eigen::InnerStride<>{run.stride}};
+          } else {
+            VecMap<T>{line, cols_n, Eigen::InnerStride<>{run.stride}} =
+                CVecMap<T>{flat, cols_n, Eigen::InnerStride<>{1}};
+          }
         } else {
-          line[col.offset()] = flat[c];
+          index_t c = 0;
+          for_each_offset(
+              [&](const index_t col_offset) noexcept {
+                if constexpr (D == Direction::gather) {
+                  flat[c] = line[col_offset];
+                } else {
+                  line[col_offset] = flat[c];
+                }
+                ++c;
+              },
+              cols);
         }
-      }
-    }
-  }
+      },
+      rows);
 }
 
 // --- the step strategies -----------------------------------------------------
@@ -103,63 +132,69 @@ struct GemmKernel {
   template <CScalar T>
   static void run(const StepGeom &g, const T *left, const T *right, T *out,
                   T *scratch) noexcept {
-    Odometer lb{g.l.batch};
-    Odometer rb{g.r.batch};
-    Odometer ob{g.out.batch};
-    for (index_t b = 0; b < g.batches; ++b, ++lb, ++rb, ++ob) {
-      const T *lp = left + lb.offset();
-      const T *rp = right + rb.offset();
-      T *op = out + ob.offset();
+    const index_t m = g.m();
+    const index_t n = g.n();
+    const index_t k = g.k();
+    // One walk per operand, advanced together: the three batch groups name the
+    // same labels and so have the same extents, which is what makes them zip.
+    for_each_offset(
+        [&](const index_t lb, const index_t rb, const index_t ob) noexcept {
+          const T *lp = left + lb;
+          const T *rp = right + rb;
+          T *op = out + ob;
 
-      index_t l_outer = g.l.outer_stride;
-      if (!g.l.mappable) {
-        shuffle<Direction::gather, T>(scratch + g.l.pack_offset, lp, g.l.rows, g.l.cols, g.m,
-                                      g.k);
-        lp = scratch + g.l.pack_offset;
-        l_outer = std::max<index_t>(g.k, 1);
-      }
-      index_t r_outer = g.r.outer_stride;
-      if (!g.r.mappable) {
-        shuffle<Direction::gather, T>(scratch + g.r.pack_offset, rp, g.r.rows, g.r.cols, g.k,
-                                      g.n);
-        rp = scratch + g.r.pack_offset;
-        r_outer = std::max<index_t>(g.n, 1);
-      }
-      T *dp = op;
-      index_t o_outer = g.out.outer_stride;
-      if (!g.out.mappable) {
-        dp = scratch + g.out.pack_offset;
-        o_outer = std::max<index_t>(g.n, 1);
-      }
+          index_t l_outer = g.l.outer_stride;
+          if (!g.l.mappable) {
+            shuffle<Direction::gather, T>(scratch + g.l.pack_offset, lp,
+                                          g.l.rows, g.l.cols);
+            lp = scratch + g.l.pack_offset;
+            l_outer = std::max<index_t>(k, 1);
+          }
+          index_t r_outer = g.r.outer_stride;
+          if (!g.r.mappable) {
+            shuffle<Direction::gather, T>(scratch + g.r.pack_offset, rp,
+                                          g.r.rows, g.r.cols);
+            rp = scratch + g.r.pack_offset;
+            r_outer = std::max<index_t>(n, 1);
+          }
+          T *dp = op;
+          index_t o_outer = g.out.outer_stride;
+          if (!g.out.mappable) {
+            dp = scratch + g.out.pack_offset;
+            o_outer = std::max<index_t>(n, 1);
+          }
 
-      const bool l_col = g.l.mappable && g.l.transposed;
-      const bool r_col = g.r.mappable && g.r.transposed;
-      const bool o_col = g.out.mappable && g.out.transposed;
+          const bool l_col = g.l.mappable && g.l.transposed;
+          const bool r_col = g.r.mappable && g.r.transposed;
+          const bool o_col = g.out.mappable && g.out.transposed;
 
-      const auto with_out = [&](const auto &a, const auto &bm) noexcept {
-        if (o_col) {
-          ColMap<T>{dp, g.m, g.n, Eigen::OuterStride<>{o_outer}}.noalias() = a * bm;
-        } else {
-          RowMap<T>{dp, g.m, g.n, Eigen::OuterStride<>{o_outer}}.noalias() = a * bm;
-        }
-      };
-      const auto with_right = [&](const auto &a) noexcept {
-        if (r_col) {
-          with_out(a, CColMap<T>{rp, g.k, g.n, Eigen::OuterStride<>{r_outer}});
-        } else {
-          with_out(a, CRowMap<T>{rp, g.k, g.n, Eigen::OuterStride<>{r_outer}});
-        }
-      };
-      if (l_col) {
-        with_right(CColMap<T>{lp, g.m, g.k, Eigen::OuterStride<>{l_outer}});
-      } else {
-        with_right(CRowMap<T>{lp, g.m, g.k, Eigen::OuterStride<>{l_outer}});
-      }
+          const auto with_out = [&](const auto &a, const auto &bm) noexcept {
+            if (o_col) {
+              ColMap<T>{dp, m, n, Eigen::OuterStride<>{o_outer}}.noalias() =
+                  a * bm;
+            } else {
+              RowMap<T>{dp, m, n, Eigen::OuterStride<>{o_outer}}.noalias() =
+                  a * bm;
+            }
+          };
+          const auto with_right = [&](const auto &a) noexcept {
+            if (r_col) {
+              with_out(a, CColMap<T>{rp, k, n, Eigen::OuterStride<>{r_outer}});
+            } else {
+              with_out(a, CRowMap<T>{rp, k, n, Eigen::OuterStride<>{r_outer}});
+            }
+          };
+          if (l_col) {
+            with_right(CColMap<T>{lp, m, k, Eigen::OuterStride<>{l_outer}});
+          } else {
+            with_right(CRowMap<T>{lp, m, k, Eigen::OuterStride<>{l_outer}});
+          }
 
-      if (!g.out.mappable) {
-        shuffle<Direction::disperse, T>(dp, op, g.out.rows, g.out.cols, g.m, g.n);
-      }
-    }
+          if (!g.out.mappable) {
+            shuffle<Direction::disperse, T>(dp, op, g.out.rows, g.out.cols);
+          }
+        },
+        g.l.batch, g.r.batch, g.out.batch);
   }
 };
 
@@ -173,25 +208,27 @@ struct HadamardKernel {
     const Collapsed lb = collapse(g.l.batch);
     const Collapsed rb = collapse(g.r.batch);
     const Collapsed ob = collapse(g.out.batch);
+    const index_t batches = g.batches();
     if (lb.ok && rb.ok && ob.ok) {
-      VecMap<T>{out, g.batches, Eigen::InnerStride<>{ob.stride}} =
-          CVecMap<T>{left, g.batches, Eigen::InnerStride<>{lb.stride}}.cwiseProduct(
-              CVecMap<T>{right, g.batches, Eigen::InnerStride<>{rb.stride}});
+      VecMap<T>{out, batches, Eigen::InnerStride<>{ob.stride}} =
+          CVecMap<T>{left, batches, Eigen::InnerStride<>{lb.stride}}
+              .cwiseProduct(
+                  CVecMap<T>{right, batches, Eigen::InnerStride<>{rb.stride}});
       return;
     }
-    Odometer lo{g.l.batch};
-    Odometer ro{g.r.batch};
-    Odometer oo{g.out.batch};
-    for (index_t b = 0; b < g.batches; ++b, ++lo, ++ro, ++oo) {
-      out[oo.offset()] = left[lo.offset()] * right[ro.offset()];
-    }
+    for_each_offset(
+        [&](const index_t lo, const index_t ro, const index_t oo) noexcept {
+          out[oo] = left[lo] * right[ro];
+        },
+        g.l.batch, g.r.batch, g.out.batch);
   }
 };
 
 template <typename K, typename T>
-concept CStepKernel = CScalar<T> && requires(const StepGeom &g, const T *in, T *out) {
-  { K::template run<T>(g, in, in, out, out) } -> std::same_as<void>;
-};
+concept CStepKernel =
+    CScalar<T> && requires(const StepGeom &g, const T *in, T *out) {
+      { K::template run<T>(g, in, in, out, out) } -> std::same_as<void>;
+    };
 
 static_assert(CStepKernel<GemmKernel, double>);
 static_assert(CStepKernel<HadamardKernel, double>);
@@ -203,23 +240,25 @@ static_assert(CStepKernel<HadamardKernel, double>);
 struct ReduceKernel {
   template <CScalar T>
   static void run(const PrepGeom &pg, const T *src, T *dst) noexcept {
-    const index_t keep_n = pg.keep.size();
-    const index_t red_n = pg.red.size();
-    Odometer keep{pg.keep};
-    for (index_t i = 0; i < keep_n; ++i, ++keep) {
-      const T *base = src + keep.offset();
-      if (pg.red_run.ok) {
-        dst[i] = CVecMap<T>{base, pg.red_run.extent, Eigen::InnerStride<>{pg.red_run.stride}}
-                     .sum();
-      } else {
-        T acc{};
-        Odometer red{pg.red};
-        for (index_t j = 0; j < red_n; ++j, ++red) {
-          acc += base[red.offset()];
-        }
-        dst[i] = acc;
-      }
-    }
+    index_t i = 0;
+    for_each_offset(
+        [&](const index_t keep_offset) noexcept {
+          const T *base = src + keep_offset;
+          if (pg.red_run.ok) {
+            dst[i] = CVecMap<T>{base, pg.red_run.extent,
+                                Eigen::InnerStride<>{pg.red_run.stride}}
+                         .sum();
+          } else {
+            // The reduced axes do not collapse to one stride, so there is no
+            // vector for Eigen to sum: the offsets are added one at a time.
+            T acc{};
+            for_each_offset(
+                [&](const index_t red) noexcept { acc += base[red]; }, pg.red);
+            dst[i] = acc;
+          }
+          ++i;
+        },
+        pg.keep);
   }
 };
 
@@ -229,7 +268,8 @@ struct ReduceKernel {
 // vector assignment, whatever either side's stride along it happens to be.
 struct PermuteKernel {
   template <CScalar T>
-  static void run(const TensorView<T> &dst, const T *src, const Layout &src_layout) noexcept {
+  static void run(const TensorView<T> &dst, const T *src,
+                  const Layout &src_layout) noexcept {
     const std::size_t rank = dst.rank();
     if (rank == 0) {
       dst.data[0] = src[0];
@@ -240,17 +280,18 @@ struct PermuteKernel {
     const index_t src_step = src_layout.strides[rank - 1];
 
     // Everything but the innermost axis, which the vector assignment covers.
-    const auto but_last = [rank](const Shape &s) {
-      return Shape{s | std::views::take(rank - 1)};
+    const auto but_last = [rank](const Layout &lay) {
+      return Layout{.shape = Shape{std::from_range,
+                                   lay.shape | std::views::take(rank - 1)},
+                    .strides = Shape{std::from_range,
+                                     lay.strides | std::views::take(rank - 1)}};
     };
-    const Shape outer = but_last(dst.layout.shape);
-    Odometer to{outer, but_last(dst.layout.strides)};
-    Odometer from{outer, but_last(src_layout.strides)};
-    const index_t rows = product(outer);
-    for (index_t o = 0; o < rows; ++o, ++to, ++from) {
-      VecMap<T>{dst.data + to.offset(), inner, Eigen::InnerStride<>{dst_step}} =
-          CVecMap<T>{src + from.offset(), inner, Eigen::InnerStride<>{src_step}};
-    }
+    for_each_offset(
+        [&](const index_t to, const index_t from) noexcept {
+          VecMap<T>{dst.data + to, inner, Eigen::InnerStride<>{dst_step}} =
+              CVecMap<T>{src + from, inner, Eigen::InnerStride<>{src_step}};
+        },
+        but_last(dst.layout), but_last(src_layout));
   }
 };
 

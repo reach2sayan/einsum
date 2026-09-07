@@ -23,7 +23,8 @@ template <std::size_t N> struct FixedString {
   // Length in characters, excluding the terminating NUL.
   [[nodiscard]] static constexpr std::size_t size() noexcept { return N - 1; }
 
-  // constexpr, not consteval: the runtime parser reads this back to cross-check.
+  // constexpr, not consteval: the runtime parser reads this back to
+  // cross-check.
   [[nodiscard]] constexpr std::string_view view() const noexcept {
     return {data, size()};
   }

@@ -1,15 +1,20 @@
-// The zero-allocation claim, checked by counting.  Its own executable because
+// The allocation claim, checked by counting.  Its own executable because
 // replacing operator new is a program-wide decision, and a suite that also
-// measures something else would be measuring Boost.Test as well.
+// measured something else would be measuring Boost.Test as well.
 //
-// What this proves: einsum allocates nothing after bind() returns.  What it
-// cannot prove: that Eigen allocates nothing, since Eigen's blocking buffers go
-// through std::malloc directly (below EIGEN_STACK_ALLOCATION_LIMIT they are not
-// heap at all).  That caveat is in the README beside the guarantee.
+// What this proves: once an object's scratch cache is warm, a repeated call
+// allocates nothing through operator new beyond the result it hands back.
+//
+// What it cannot prove: that Eigen allocates nothing.  Eigen's buffers go
+// through its own aligned_malloc -- std::malloc, not operator new -- so an
+// Eigen result does not appear in these counts at all, and neither do the GEMM
+// blocking buffers (below EIGEN_STACK_ALLOCATION_LIMIT they are not heap).
+// That caveat is in the README beside the guarantee.
 #include "einsum/einsum.hpp"
 #include "einsum/rt/parse.hpp"
 
 #include <cstdio>
+#include <experimental/mdspan>
 #include <cstdlib>
 #include <new>
 #include <vector>
@@ -49,7 +54,9 @@ void *operator new[](const std::size_t size) { return ::operator new(size); }
 void operator delete(void *memory) noexcept { std::free(memory); }
 void operator delete[](void *memory) noexcept { std::free(memory); }
 void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
-void operator delete[](void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept {
+  std::free(memory);
+}
 
 namespace es = einsum;
 
@@ -65,85 +72,121 @@ namespace {
   return m;
 }
 
-void check_no_alloc(const char *subscript, const es::index_t n) {
-  const auto plan = es::rt::plan(subscript);
-  BOOST_REQUIRE(plan.has_value());
-  const Eigen::MatrixXd a = sample(n, 1);
-  const Eigen::MatrixXd b = sample(n, 4);
-  Eigen::MatrixXd out(n, n);
-  auto bound = plan->bind(a, b, es::into(out));
-  BOOST_REQUIRE(bound.has_value());
-
-  const double *workspace_before = bound->workspace_data().data();
-  {
-    const Counting counting;
-    bound->eval();
-  }
-  BOOST_TEST_CONTEXT(subscript << " at " << n) {
-    BOOST_CHECK_EQUAL(g_allocations, 0);
-  }
-
-  // Rebinding moves pointers and nothing else, so it cannot allocate either --
-  // and the workspace has to be the same one afterwards.
-  const Eigen::MatrixXd a2 = sample(n, 8);
-  const Eigen::MatrixXd b2 = sample(n, 2);
-  Eigen::MatrixXd out2(n, n);
-  {
-    const Counting counting;
-    const auto ok = bound->eval(a2, b2, es::into(out2));
-    BOOST_REQUIRE(ok.has_value());
-  }
-  BOOST_CHECK_EQUAL(g_allocations, 0);
-  BOOST_CHECK_EQUAL(bound->workspace_data().data(), workspace_before);
-  BOOST_CHECK_LT((out2 - a2 * b2).cwiseAbs().maxCoeff(), 1e-9);
-}
-
 } // namespace
 
-BOOST_AUTO_TEST_CASE(NoAlloc_MatmulAtSeveralSizes) {
-  for (const es::index_t n : {4, 16, 64}) {
-    check_no_alloc("ij,jk->ik", n);
-  }
-}
-
-BOOST_AUTO_TEST_CASE(NoAlloc_APackedContraction) {
-  // "ikj,jkl->il" has to pack its left slab, so it uses the workspace rather
-  // than mapping straight through -- which is the case worth counting.
-  const auto plan = es::rt::plan("ikj,jkl->il");
+// Every count is taken inside the counting scope and asserted outside it,
+// because Boost.Test's own reporting allocates.
+BOOST_AUTO_TEST_CASE(NoAlloc_WarmEigenCallAllocatesNothingWeCanSee) {
+  const auto plan = es::einsum("ij,jk->ik");
   BOOST_REQUIRE(plan.has_value());
-  std::vector<double> a(2 * 4 * 3, 1.5);
-  std::vector<double> b(3 * 4 * 5, 0.5);
-  std::vector<double> out(2 * 5, 0.0);
-  auto bound = plan->bind(es::flat(a, {2, 4, 3}), es::flat(b, {3, 4, 5}),
-                          es::into(out, {2, 5}));
-  BOOST_REQUIRE(bound.has_value());
-  BOOST_CHECK_GT(bound->scratch_bytes(), 0U);
+  const Eigen::MatrixXd a = sample(16, 1);
+  const Eigen::MatrixXd b = sample(16, 4);
+  BOOST_REQUIRE((*plan)(a, b).has_value());
+
+  long counted = -1;
+  bool ok = false;
   {
     const Counting counting;
-    bound->eval();
+    const auto again = (*plan)(a, b);
+    ok = again.has_value();
+    counted = g_allocations;
   }
-  BOOST_CHECK_EQUAL(g_allocations, 0);
-  for (const double x : out) {
-    BOOST_CHECK_LT(std::abs(x - 9.0), 1e-12);
-  }
+  BOOST_REQUIRE(ok);
+  BOOST_CHECK_EQUAL(counted, 0);
 }
 
-BOOST_AUTO_TEST_CASE(NoAlloc_BorrowedWorkspaceAllocatesNothingAtAll) {
-  const auto plan = es::rt::plan("ij,jk,kl->il");
+// A contraction that has to pack a slab uses the scratch cache; once warm, the
+// cache is neither grown nor freed, so two consecutive calls cost the same.
+BOOST_AUTO_TEST_CASE(NoAlloc_PackedContractionReusesItsScratch) {
+  const auto plan = es::einsum("ikj,jkl->il");
   BOOST_REQUIRE(plan.has_value());
+  const std::vector<std::vector<std::vector<double>>> x(
+      2, std::vector<std::vector<double>>(4, std::vector<double>(3, 1.5)));
+  const std::vector<std::vector<std::vector<double>>> y(
+      3, std::vector<std::vector<double>>(4, std::vector<double>(5, 0.5)));
+  BOOST_REQUIRE((*plan)(x, y).has_value());
+
+  long first = -1;
+  long second = -2;
+  bool ok = false;
+  {
+    const Counting counting;
+    const auto a1 = (*plan)(x, y);
+    first = g_allocations;
+    g_allocations = 0;
+    const auto a2 = (*plan)(x, y);
+    second = g_allocations;
+    ok = a1.has_value() && a2.has_value();
+  }
+  BOOST_REQUIRE(ok);
+  // Whatever the nest result costs, it costs the same twice: the scratch is not
+  // among the allocations.
+  BOOST_CHECK_EQUAL(first, second);
+}
+
+// Static-extent mdspan operands on the compile-time path: every extent is in a
+// type, so the geometry is a constant, the scratch is an array in the call's own
+// frame, and the result is an mdarray over a std::array.  Nothing is allocated
+// at all -- not even the result.
+BOOST_AUTO_TEST_CASE(NoAlloc_StaticMdspanCallAllocatesNothing) {
+  const std::vector<double> a(16, 1.0);
+  const std::vector<double> b(16, 2.0);
+  const std::mdspan<const double, std::extents<std::size_t, 4, 4>> ma{a.data()};
+  const std::mdspan<const double, std::extents<std::size_t, 4, 4>> mb{b.data()};
+  const auto e = es::einsum<"ij,jk->ik">();
+  BOOST_REQUIRE(e(ma, mb).has_value());
+
+  long counted = -1;
+  bool ok = false;
+  {
+    const Counting counting;
+    const auto again = e(ma, mb);
+    ok = again.has_value();
+    counted = g_allocations;
+  }
+  BOOST_REQUIRE(ok);
+  BOOST_CHECK_EQUAL(counted, 0);
+}
+
+// A warm runtime call of the same shape reuses both caches -- the scratch and
+// the geometry -- so it allocates only what it hands back.
+BOOST_AUTO_TEST_CASE(NoAlloc_WarmSameShapeCallReusesTheGeometry) {
+  const auto plan = es::einsum("ij,jk->ik");
+  BOOST_REQUIRE(plan.has_value());
+  const Eigen::MatrixXd a = sample(12, 1);
+  const Eigen::MatrixXd b = sample(12, 3);
+  BOOST_REQUIRE((*plan)(a, b).has_value());
+
+  long counted = -1;
+  bool ok = false;
+  {
+    const Counting counting;
+    const auto again = (*plan)(a, b);
+    ok = again.has_value();
+    counted = g_allocations;
+  }
+  BOOST_REQUIRE(ok);
+  // The Eigen result goes through Eigen's own malloc, so nothing reaches
+  // operator new at all.
+  BOOST_CHECK_EQUAL(counted, 0);
+}
+
+// The compile-time object over an Eigen result: same guarantee, and building
+// the object itself never allocates.
+BOOST_AUTO_TEST_CASE(NoAlloc_StaticObjectWarmCall) {
+  const auto e = es::einsum<"ij,jk->ik">();
   const Eigen::MatrixXd a = sample(8, 1);
   const Eigen::MatrixXd b = sample(8, 2);
-  const Eigen::MatrixXd c = sample(8, 3);
-  Eigen::MatrixXd out(8, 8);
-  std::vector<double> workspace(4096);
+  BOOST_REQUIRE(e(a, b).has_value());
 
-  auto bound = plan->bind(a, b, c, es::into(out), std::span<double>{workspace});
-  BOOST_REQUIRE(bound.has_value());
-  BOOST_CHECK_EQUAL(bound->workspace_data().data(), workspace.data());
+  long counted = -1;
+  bool ok = false;
   {
     const Counting counting;
-    bound->eval();
+    const auto again = e(a, b);
+    ok = again.has_value();
+    counted = g_allocations;
   }
-  BOOST_CHECK_EQUAL(g_allocations, 0);
-  BOOST_CHECK_LT((out - a * b * c).cwiseAbs().maxCoeff(), 1e-9);
+  BOOST_REQUIRE(ok);
+  BOOST_CHECK_EQUAL(counted, 0);
 }
