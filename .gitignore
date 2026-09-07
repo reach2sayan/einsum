@@ -569,3 +569,5 @@ build/
 /cmake-build-release/
 /build_debug/*
 /build_release/*
+# Pinned third-party sources, unpacked by cmake/EinsumDependencies.cmake
+/.deps/

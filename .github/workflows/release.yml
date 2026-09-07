@@ -20,6 +20,8 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The header-only library only: einsum::rt::plan() is compiled into
+      # libeinsum_rt and cannot travel in a header.
       - name: Regenerate single header
         run: python3 scripts/amalgamate.py
 
