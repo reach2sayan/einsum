@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.26)
 
 # Newest GCC on PATH, unless the caller chose a compiler.  Must precede
-# project(): the default g++ here is 13, which has no std::ranges::to.
+# project(): the default g++ here is 13, which is below the <expected> floor
+# the toolchain probe checks for.
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
         AND NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
     find_program(EINSUM_PREFERRED_CXX NAMES g++-15 g++-14)

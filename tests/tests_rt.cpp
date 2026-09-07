@@ -9,6 +9,7 @@
 #include "einsum/rt/parse.hpp"
 
 #include <cmath>
+#include <string_view>
 #include <experimental/mdarray>
 #include <experimental/mdspan>
 #include <vector>
@@ -26,6 +27,16 @@ namespace {
 
 using Matrix = Eigen::MatrixXd;
 using Nest = std::vector<std::vector<double>>;
+
+// The reason a call failed, or "ok" when it did not.  BOOST_REQUIRE_MESSAGE
+// evaluates its message argument whether or not the check passes, and
+// `.error()` on an expected that holds a value is undefined -- with assertions
+// on it aborts the whole test binary, which is a far worse report than the
+// failure it was meant to describe.
+template <typename R>
+[[nodiscard]] std::string_view why(const R &r) noexcept {
+  return r.has_value() ? std::string_view{"ok"} : es::message(r.error().code);
+}
 
 [[nodiscard]] Matrix sample(const index_t rows, const index_t cols,
                             const int seed) {
@@ -120,7 +131,7 @@ template <typename Family> void check_matmul(const index_t n) {
   const auto plan = es::einsum("ij,jk->ik");
   BOOST_REQUIRE(plan.has_value());
   const auto got = (*plan)(left.operand(), right.operand());
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_CHECK_LT((Family::read(*got) - a * b).cwiseAbs().maxCoeff(), 1e-12);
 }
 
@@ -235,7 +246,7 @@ BOOST_AUTO_TEST_CASE(RtMixedRank_MatrixTimesVector) {
   const Matrix a = sample(4, 5, 1);
   const Eigen::VectorXd v = Eigen::VectorXd::LinSpaced(5, 1.0, 5.0);
   const auto got = (*plan)(a, v);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   const Eigen::VectorXd want = a * v;
   BOOST_CHECK_EQUAL(got->rows(), 4);
   BOOST_CHECK_EQUAL(got->cols(), 1);
@@ -263,7 +274,7 @@ BOOST_AUTO_TEST_CASE(RtRankThree_NestFamily) {
   const auto plan = es::einsum("bij,bjk->bik");
   BOOST_REQUIRE(plan.has_value());
   const auto got = (*plan)(x, id);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_REQUIRE_EQUAL(got->size(), 2U);
   for (std::size_t b = 0; b < 2; ++b) {
     for (std::size_t i = 0; i < 2; ++i) {
@@ -353,14 +364,14 @@ BOOST_AUTO_TEST_CASE(RtGather_ColumnMajorEigenOperand) {
       b = sample(5, 3, 7);
 
   const auto mixed = (*plan)(a, b);
-  BOOST_REQUIRE_MESSAGE(mixed.has_value(), es::message(mixed.error().code));
+  BOOST_REQUIRE_MESSAGE(mixed.has_value(), why(mixed));
   BOOST_CHECK_LT((*mixed - a * b).cwiseAbs().maxCoeff(), 1e-12);
 
   // And with the orders swapped, so neither is the only one that works.
   const Matrix c =
       sample(3, 2, 9); // column-major again, on the right this time
   const auto flipped = (*plan)(b, c);
-  BOOST_REQUIRE_MESSAGE(flipped.has_value(), es::message(flipped.error().code));
+  BOOST_REQUIRE_MESSAGE(flipped.has_value(), why(flipped));
   BOOST_CHECK_LT((*flipped - b * c).cwiseAbs().maxCoeff(), 1e-12);
 }
 
@@ -392,7 +403,7 @@ BOOST_AUTO_TEST_CASE(RtGather_LayoutLeftMdspanOperand) {
       mb{bb.data(), 5, 3};
 
   const auto got = (*plan)(ma, mb);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_CHECK_LT((MdspanFamily::read(*got) - a * b).cwiseAbs().maxCoeff(), 1e-12);
 }
 
@@ -423,7 +434,7 @@ BOOST_AUTO_TEST_CASE(RtTensor_BatchedMatmul) {
   const auto plan = es::einsum("bij,bjk->bik");
   BOOST_REQUIRE(plan.has_value());
   const auto got = (*plan)(x, id);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   for (int bi = 0; bi < 2; ++bi) {
     for (int i = 0; i < 2; ++i) {
       for (int j = 0; j < 2; ++j) {
@@ -465,7 +476,7 @@ BOOST_AUTO_TEST_CASE(RtCache_KeyIncludesStridesAndShape) {
   // the column-major one's geometry.
   const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> ar = a;
   const auto swapped = (*plan)(ar, b);
-  BOOST_REQUIRE_MESSAGE(swapped.has_value(), es::message(swapped.error().code));
+  BOOST_REQUIRE_MESSAGE(swapped.has_value(), why(swapped));
   BOOST_CHECK_LT((*swapped - a * b).cwiseAbs().maxCoeff(), 1e-12);
 
   // And a different shape after that, so the cache is replaced rather than kept.
@@ -523,7 +534,7 @@ BOOST_AUTO_TEST_CASE(RtBroadcast_DiagonalIsSquareInItsOwnOperand) {
   Eigen::MatrixXd b(1, 1);
   b << 2.0;
   const auto got = (*plan)(a, b);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_REQUIRE_EQUAL(got->rows(), 5);
   for (index_t i = 0; i < 5; ++i) {
     BOOST_CHECK_LT(std::abs((*got)(i, 0) - a(i) * 2.0), 1e-12);
@@ -559,7 +570,7 @@ BOOST_AUTO_TEST_CASE(RtEllipsis_BatchedMatmulOverTensors) {
     }
   }
   const auto got = (*plan)(x, y);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   for (int b = 0; b < 2; ++b) {
     for (int i = 0; i < 2; ++i) {
       for (int k = 0; k < 2; ++k) {
@@ -597,7 +608,7 @@ BOOST_AUTO_TEST_CASE(RtEllipsis_LeftOnlyAndRightAligned) {
     }
   }
   const auto got = (*plan)(x, y);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   for (int b = 0; b < 5; ++b) {
     for (int i = 0; i < 2; ++i) {
       for (int k = 0; k < 4; ++k) {
@@ -619,7 +630,7 @@ BOOST_AUTO_TEST_CASE(RtBroadcast_NamedLabelStretches) {
   const Nest thin{{2.0}, {3.0}, {4.0}};                 // (3, 1)
   const Nest wide{{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
   const auto got = (*plan)(thin, wide);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_REQUIRE_EQUAL(got->size(), 3U);
   BOOST_REQUIRE_EQUAL((*got)[0].size(), 4U);
   for (std::size_t i = 0; i < 3; ++i) {
@@ -640,7 +651,7 @@ BOOST_AUTO_TEST_CASE(RtBroadcast_InsideAReducedLabel) {
   const Nest thin{{2.0}, {3.0}, {4.0}};
   const Nest wide{{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
   const auto got = (*plan)(thin, wide);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   double want = 0.0;
   for (std::size_t i = 0; i < 3; ++i) {
     for (std::size_t j = 0; j < 4; ++j) {
@@ -666,7 +677,7 @@ BOOST_AUTO_TEST_CASE(RtEllipsis_DiagonalAfterExpansion) {
     }
   }
   const auto got = (*plan)(x);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
 
   // The contraction is rank 2, but on this path the result TYPE is the widest
   // operand's -- a rank-3 Tensor -- because the return type cannot see the
@@ -698,7 +709,7 @@ BOOST_AUTO_TEST_CASE(RtEllipsis_OutputMustNameTheBroadcastAxes) {
   BOOST_REQUIRE(flat.has_value());
   const Eigen::VectorXd v = Eigen::VectorXd::LinSpaced(4, 1.0, 4.0);
   const auto ok = (*flat)(v);
-  BOOST_REQUIRE_MESSAGE(ok.has_value(), es::message(ok.error().code));
+  BOOST_REQUIRE_MESSAGE(ok.has_value(), why(ok));
   BOOST_CHECK_LT((ok->col(0) - v).cwiseAbs().maxCoeff(), 1e-12);
 }
 
@@ -722,7 +733,7 @@ BOOST_AUTO_TEST_CASE(RtBroadcast_MdspanEllipsisStretchesTheBatch) {
   const Md3 y{ys.data(), 5, 3, 4};
 
   const auto got = (*plan)(x, y);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_REQUIRE_EQUAL(got->extent(0), 5U);
   BOOST_REQUIRE_EQUAL(got->extent(1), 2U);
   BOOST_REQUIRE_EQUAL(got->extent(2), 4U);
@@ -767,7 +778,7 @@ BOOST_AUTO_TEST_CASE(RtBroadcast_StrideZeroOnTheGemmBatchAxis) {
   }
 
   const auto got = (*plan)(l, r);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_REQUIRE_EQUAL(got->size(), 5U);
   for (std::size_t b = 0; b < 5; ++b) {
     for (std::size_t i = 0; i < 2; ++i) {
@@ -804,7 +815,7 @@ BOOST_AUTO_TEST_CASE(RtPath_GreedyContractsTheCheapPairFirst) {
   const Matrix b = sample(100, 2, 2);
   const Matrix c = sample(2, 100, 3);
   const auto got = (*thin)(a, b, c);
-  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
   BOOST_CHECK_LT((*got - a * b * c).cwiseAbs().maxCoeff(), 1e-9);
 
   const es::Path &chosen = es::impl::einsum_access::last_path(*thin);
@@ -819,7 +830,7 @@ BOOST_AUTO_TEST_CASE(RtPath_GreedyContractsTheCheapPairFirst) {
   const Matrix e = sample(2, 100, 2);
   const Matrix f = sample(100, 2, 3);
   const auto other = (*fat)(d, e, f);
-  BOOST_REQUIRE_MESSAGE(other.has_value(), es::message(other.error().code));
+  BOOST_REQUIRE_MESSAGE(other.has_value(), why(other));
   BOOST_CHECK_LT((*other - d * e * f).cwiseAbs().maxCoeff(), 1e-9);
 
   const es::Path &second = es::impl::einsum_access::last_path(*fat);
