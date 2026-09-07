@@ -22,7 +22,10 @@ namespace einsum {
 // template argument, so every way it can be wrong is a static_assert carrying
 // the sentence the runtime error would have carried -- and so the operand count
 // is a constant, which is what lets this one also take an output.
-template <impl::FixedString S> class StaticEinsum : public Einsum {
+template <impl::FixedString S, path P = path::greedy>
+class StaticEinsum : public Einsum {
+  friend struct einsum::impl::einsum_access;
+
   static constexpr Subscripts kSubscripts = ct::subscripts<S>::value;
 
   static constexpr auto kPlanResult = impl::make_plan(kSubscripts);
@@ -33,7 +36,7 @@ template <impl::FixedString S> class StaticEinsum : public Einsum {
 public:
   StaticEinsum() noexcept
       : Einsum{einsum::impl::einsum_access::make<einsum::impl::HeapScratch>(
-            kPlanResult.value_or(Plan{}))} {}
+            kPlanResult.value_or(Plan{}), P)} {}
 
   // A constant here, unlike on the runtime path, which is the whole reason the
   // output form below can exist: one more argument than the subscript names is
@@ -82,12 +85,30 @@ private:
   // Every extent is in a type, so the shape, the output layout, the Geometry
   // and the scratch size are all constants, and the scratch is an array in this
   // frame rather than anything the object had to allocate.
-  template <typename... Ops> struct Lowered {
-    static constexpr std::array<Layout, sizeof...(Ops)> layouts{
+  template <COperand... Ops>
+    requires(ct::all_static<Ops...>())
+  struct Lowered {
+    static constexpr std::array<impl::Layout, sizeof...(Ops)> layouts{
         ct::layout_of<Ops>()...};
+
+    // A '...' stands for as many axes as the operands have, and here that is a
+    // constant, so the expanded subscript and the plan built from it are too.
+    static constexpr std::array<std::uint8_t, sizeof...(Ops)> ranks{
+        static_cast<std::uint8_t>(rank_v<Ops>)...};
+    static constexpr auto kExpanded =
+        einsum::impl::expand(kSubscripts, std::span<const std::uint8_t>{ranks});
+#define EINSUM_EXPAND_FAILED(code) failed_with(kExpanded, errc::code)
+    EINSUM_ASSERT_NO_ERROR(EINSUM_EXPAND_FAILED)
+#undef EINSUM_EXPAND_FAILED
+
+    static constexpr auto kLowered = einsum::impl::make_plan(kExpanded.value_or(Subscripts{}));
+#define EINSUM_LOWERED_FAILED(code) failed_with(kLowered, errc::code)
+    EINSUM_ASSERT_NO_ERROR(EINSUM_LOWERED_FAILED)
+#undef EINSUM_LOWERED_FAILED
+    static constexpr Plan plan = kLowered.value_or(Plan{});
+
     static constexpr Shape shape =
-        impl::infer_output_shape(kPlanResult.value_or(Plan{}),
-                                 std::span<const Layout>{layouts})
+        impl::infer_output_shape(plan, std::span<const impl::Layout>{layouts})
             .value_or(Shape{});
 
     // The view family's result is an mdarray either way; here its extents are
@@ -96,30 +117,23 @@ private:
         CViewFamily<einsum::impl::first_of_t<Ops...>>,
         ct::static_mdarray_t<scalar_of_t<einsum::impl::first_of_t<Ops...>>, shape>,
         result_of_t<Ops...>>;
-    static constexpr bool direct = impl::CEigenDense<R> || impl::CEigenTensor<R> ||
-                                   impl::CMdarray<R> || rank_v<R> == 1;
-    static constexpr Layout out_layout =
+    static constexpr bool direct = CDirectWritable<R>;
+    static constexpr impl::Layout out_layout =
         einsum::impl::layout_of_result<R>(shape);
     static constexpr impl::Geometry geometry =
-        impl::make_geometry(kPlanResult.value_or(Plan{}),
-                            std::span<const Layout>{layouts}, out_layout)
+        impl::make_geometry(plan, std::span<const impl::Layout>{layouts}, out_layout, P)
             .value_or(impl::Geometry{});
 
     // The scratch the kernels want, then a packed copy of any operand they
-    // cannot address, then the output when it is one of those.
+    // cannot address, then the output when it is one of those -- laid out by
+    // the same function the runtime path uses, but here at compile time, so
+    // `total` sizes an array in the frame and the call allocates nothing.
     static constexpr std::array<bool, sizeof...(Ops)> gathered{
-        !CContiguous<Ops>...};
-    static constexpr index_t packed_bytes = [] {
-      index_t at = geometry.scratch_elems;
-      for (const auto i : std::views::iota(std::size_t{0}, sizeof...(Ops))) {
-        if (gathered[i]) {
-          at += layouts[i].size();
-        }
-      }
-      return at;
-    }();
-    static constexpr index_t total =
-        direct ? packed_bytes : packed_bytes + einsum::impl::product(shape);
+        !impl::CContiguous<Ops>...};
+    static constexpr einsum::impl::ScratchMap map = einsum::impl::scratch_offsets(
+        std::span<const impl::Layout>{layouts}, std::span<const bool>{gathered},
+        geometry.scratch_elems, shape, direct);
+    static constexpr index_t total = map.total;
 
     // One plain mappable GEMM, nothing packed and nothing summed first: the
     // case Eigen can unroll rather than block, which is the whole point of
@@ -151,7 +165,8 @@ private:
     }();
   };
 
-  template <typename... Ops>
+  template <COperand... Ops>
+    requires(ct::all_static<Ops...>())
   [[nodiscard]] auto statically(const Ops &...ops) const {
     using L = Lowered<Ops...>;
     using R = typename L::R;
@@ -188,40 +203,14 @@ private:
       product(ops...);
       return result<R>{std::move(*out)};
     } else {
-      boost::container::static_vector<TensorView<const T>, kMaxOperands> views;
-      std::size_t next = 0;
-      index_t cursor = L::geometry.scratch_elems;
-      const auto prepare = [&](const auto &op) {
-        const T *base = nullptr;
-        if constexpr (CContiguous<decltype(op)>) {
-          base = einsum::impl::data_of(op);
-        } else {
-          T *const packed = scratch.data() + cursor;
-          gather(op, packed, L::layouts[next].shape);
-          cursor += L::layouts[next].size();
-          base = packed;
-        }
-        views.push_back(TensorView<const T>{base, L::layouts[next]});
-        ++next;
-      };
-      (prepare(ops), ...);
-
-      T *target_data = nullptr;
-      if constexpr (L::direct) {
-        target_data = out->data();
-      } else {
-        target_data = scratch.data() + cursor;
-      }
-      einsum::impl::execute<T>(
-          kPlanResult.value_or(Plan{}), L::geometry,
-          std::span<const TensorView<const T>>{views},
-          TensorView<T>{target_data, L::out_layout},
-          std::span<T>{scratch}.first(
-              static_cast<std::size_t>(L::geometry.scratch_elems)));
-      if constexpr (!L::direct) {
-        const auto fitted = einsum::impl::fit_shape(L::shape, rank_v<R>);
-        scatter(static_cast<const T *>(target_data), *out, *fitted);
-      }
+      // The same contraction the runtime path runs, over a frame array rather
+      // than a pooled block and with offsets that are constants.
+      static constexpr auto kFitted =
+          einsum::impl::fit_shape(L::shape, rank_v<R>).value_or(Shape{});
+      einsum::impl::contract_into<T>(L::plan, L::geometry,
+                                     std::span<const impl::Layout>{L::layouts},
+                                     L::out_layout, scratch.data(), L::map, *out,
+                                     kFitted, ops...);
       return result<R>{std::move(*out)};
     }
   }
@@ -244,7 +233,8 @@ public:
 // einsum<"ij,jk->ik">() -- a function template rather than a variable template,
 // so that it and the runtime einsum(std::string_view) are overloads of one name
 // rather than two different kinds of entity, which C++ will not have.
-template <impl::FixedString S> [[nodiscard]] StaticEinsum<S> einsum() noexcept {
+template <impl::FixedString S, path P = path::greedy>
+[[nodiscard]] StaticEinsum<S, P> einsum() noexcept {
   return {};
 }
 

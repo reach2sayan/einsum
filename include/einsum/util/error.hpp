@@ -26,7 +26,7 @@ namespace einsum {
 // clang-format off
 #define EINSUM_ERRC_SEQ                                                                          \
   ((bad_syntax,             "the subscript has a character this grammar does not accept"))       \
-  ((ellipsis_unsupported,   "'...' is not supported: name every axis"))                          \
+  ((ellipsis_repeated,      "a term has more than one '...'"))                                 \
   ((empty_operand,          "an operand between the commas has no labels"))                      \
   ((no_operands,            "the subscript names no operands"))                                  \
   ((too_many_operands,      "more operands than einsum::kMaxOperands"))                          \
@@ -38,6 +38,8 @@ namespace einsum {
   ((operand_count_mismatch, "the subscript and the call disagree on how many operands there are")) \
   ((rank_mismatch,          "an operand's rank differs from the number of labels it was given")) \
   ((extent_conflict,        "one label is bound to two different extents"))                      \
+  ((broadcast_mismatch,     "the '...' dimensions do not broadcast"))                            \
+  ((ellipsis_not_in_output, "the operands' '...' covers axes the output does not name"))         \
   ((output_mismatch,        "the output's rank or extents are not the ones the subscript implies"))
 // clang-format on
 

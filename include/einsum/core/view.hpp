@@ -21,7 +21,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace einsum {
+namespace einsum::impl {
 
 // --- layout policies ---------------------------------------------------------
 // The two orders as types, so a compile-time operand names one and the runtime
@@ -30,7 +30,6 @@ enum class layout : std::uint8_t { row_major, col_major };
 inline constexpr layout row_major = layout::row_major;
 inline constexpr layout col_major = layout::col_major;
 
-namespace impl {
 // The two orders are one walk over the axes in opposite directions: the stride
 // of an axis is the product of the extents inside it, and "inside" is the only
 // thing they disagree about.
@@ -45,7 +44,6 @@ packed_strides(const Shape &shape, const bool innermost_last) noexcept {
   }
   return out;
 }
-} // namespace impl
 
 struct RowMajor {
   static constexpr layout order = layout::row_major;
@@ -102,9 +100,14 @@ template <CLayoutPolicy P>
 // what this replaced, but recomputing the dot product per element cost +82% on
 // a 64x64 transpose and +45% on a batched matmul -- not a price a walk this hot
 // can pay.
+// One index_t per layout: the callback is handed the operands' offsets, so its
+// arity is the operand count and is checked here rather than inside std::apply.
+template <typename> using offset_arg_t = index_t;
+
 template <typename F, typename... L>
   requires(sizeof...(L) >= 1) &&
-          (std::same_as<std::remove_cvref_t<L>, Layout> && ...)
+          (std::same_as<std::remove_cvref_t<L>, Layout> && ...) &&
+          std::invocable<F &, offset_arg_t<L>...>
 constexpr void for_each_offset(F &&fn, const L &...layouts) noexcept {
   constexpr std::size_t kOperands = sizeof...(L);
 
@@ -156,7 +159,7 @@ make_layout(const Shape &shape, const layout order = row_major) noexcept {
 // A Tensor's own strides: it is densely packed, and its Layout says which end
 // moves fastest.  ColMajor here means the FIRST index is fastest, which is
 // einsum's col_major.
-template <typename B>
+template <CEigenTensor B>
 [[nodiscard]] constexpr Layout tensor_layout(const Shape &shape) noexcept {
   // Both sides through int: Tensor's Layout is its own unnamed enumeration, and
   // comparing two unrelated enumerations is a warning this build treats as an
@@ -167,7 +170,9 @@ template <typename B>
 }
 
 // A pointer and a Layout; non-owning, const-correct through T.
-template <typename T> struct TensorView {
+template <typename T>
+  requires CScalar<std::remove_cv_t<T>>
+struct TensorView {
   using value_type = std::remove_cv_t<T>;
 
   T *data = nullptr;
@@ -187,7 +192,6 @@ template <typename T> struct TensorView {
   }
 };
 
-namespace impl {
 template <typename X> inline constexpr bool is_tensor_view_v = false;
 template <typename T>
 inline constexpr bool is_tensor_view_v<TensorView<T>> = true;
@@ -213,7 +217,6 @@ template <CEigenDense D>
   }
   return out;
 }
-} // namespace impl
 
 // --- the three normalisations ------------------------------------------------
 // Everything an operand can be reaches TensorView through exactly one of these.
@@ -249,7 +252,6 @@ as_view(const std::mdspan<T, E, L, A> &m) noexcept {
 // Extents first, because everything else needs them.  A nest is measured by
 // descending its first element, and every sibling has to agree: a ragged nest
 // is not a tensor, and says so rather than reading past a short row.
-namespace impl {
 
 // Depth D of R, measuring as it descends.  The first node at each level sets
 // that level's extent and every later one is held to it, so a ragged nest is
@@ -277,7 +279,6 @@ measure_nest(const X &x, std::array<index_t, R> &ext,
   }
 }
 
-} // namespace impl
 
 template <COperand X>
 [[nodiscard]] constexpr result<Shape> shape_of(const X &x) noexcept {
@@ -318,7 +319,6 @@ template <COperand X>
 // One element, whichever way its type spells the accessor.  The rank is in the
 // operand's type even when its extents are not, so the index pack is built
 // once and the three families differ only in how they consume it.
-namespace impl {
 
 template <std::size_t D, typename X, std::size_t R>
 [[nodiscard]] constexpr decltype(auto)
@@ -330,7 +330,7 @@ nest_at(X &&x, const std::array<index_t, R> &at) noexcept {
   }
 }
 
-template <typename X, std::size_t R, std::size_t... I>
+template <COperand X, std::size_t R, std::size_t... I>
 [[nodiscard]] constexpr decltype(auto)
 element_at(X &&x, const std::array<index_t, R> &at,
            std::index_sequence<I...>) noexcept {
@@ -344,7 +344,6 @@ element_at(X &&x, const std::array<index_t, R> &at,
   }
 }
 
-} // namespace impl
 
 template <COperand X>
 [[nodiscard]] constexpr decltype(auto)
@@ -397,4 +396,4 @@ constexpr void scatter(const scalar_of_t<X> *src, X &x,
   }
 }
 
-} // namespace einsum
+} // namespace einsum::impl

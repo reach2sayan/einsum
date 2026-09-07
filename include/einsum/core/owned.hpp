@@ -53,7 +53,7 @@ fit_shape(const Shape &shape, const std::size_t rank) noexcept {
 // The one place a result is created.  Eigen sizes itself from the shape; a
 // nest resizes level by level; a std::array nest has its extents in its type
 // and can only check them.
-template <typename X>
+template <COperand X>
 [[nodiscard]] result<X> make_like(const Shape &shape) noexcept;
 
 template <std::size_t D, std::size_t R, typename X>
@@ -79,7 +79,7 @@ template <std::size_t D, std::size_t R, typename X>
   }
 }
 
-template <typename X>
+template <COperand X>
 [[nodiscard]] result<X> make_like(const Shape &shape) noexcept {
   using B = std::remove_cvref_t<X>;
   if constexpr (CMdarray<B>) {
@@ -176,16 +176,18 @@ using nest_of_t = typename nest_of<T, R>::type;
 // its way out of.
 //
 // Eigen answers an Eigen matrix in the first operand's storage order (rank 0,
-// 1 and 2 being 1x1, Nx1 and MxN by Eigen's own convention); the other two
-// families answer a nest of vectors, because a view cannot own a result and a
-// nest already is one.
+// 1 and 2 being 1x1, Nx1 and MxN by Eigen's own convention); a Tensor and a
+// deep-enough nest answer their own type; the view family answers an mdarray,
+// because a view cannot own a result but the family it belongs to owns one that
+// is contiguous -- which is what lets the executor write straight into .data()
+// instead of scattering row by row.
 namespace impl {
 
-template <typename X>
+template <CEigenFamily X>
 inline constexpr int eigen_order_of =
     std::remove_cvref_t<X>::IsRowMajor ? Eigen::RowMajor : Eigen::ColMajor;
 
-template <typename... Ops>
+template <COperand... Ops>
 [[nodiscard]] consteval auto result_probe() noexcept {
   using First = std::remove_cvref_t<first_of_t<Ops...>>;
   using T = scalar_of_t<First>;
@@ -198,21 +200,29 @@ template <typename... Ops>
     // without naming Eigen's Tensor header, so the result is the widest operand
     // itself.  An output deeper than that is rank_mismatch, as for array nests.
     return std::type_identity<widest_of_t<Ops...>>{};
+  } else if constexpr (CViewFamily<First>) {
+    // An mdspan, span or pointer cannot own what it points at, so the view
+    // family's result is the owning member of that same family: an mdarray,
+    // dynamically sized here because the extents are not in the operand types.
+    // (StaticEinsum overrides this with a static-extent mdarray when they are.)
+    // Contiguous and layout_right, so the executor writes into .data() direct.
+    return std::type_identity<std::experimental::mdarray<
+        T, std::dextents<std::size_t, kRank>, std::layout_right>>{};
   } else if constexpr (CNestFamily<First> &&
                        rank_v<widest_of_t<Ops...>> == kRank) {
     // A nest that is already the right depth answers its own type, which is
     // what makes an einsum over std::array nests give back a std::array nest.
     return std::type_identity<widest_of_t<Ops...>>{};
   } else {
-    // A view cannot own a result, and a nest shallower than the output needs a
-    // deeper one than it is; both answer the vector nest of that rank.
+    // A nest shallower than the output needs a deeper one than it is, and
+    // answers the vector nest of that rank.
     return std::type_identity<nest_of_t<T, kRank>>{};
   }
 }
 
 } // namespace impl
 
-template <typename... Ops>
+template <COperand... Ops>
   requires CSameFamily<Ops...>
 using result_of_t = typename decltype(impl::result_probe<Ops...>())::type;
 

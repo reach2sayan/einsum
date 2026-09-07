@@ -134,6 +134,12 @@ result is described and not what is in it.
 | Eigen | `1x1` | `Nx1` | `MxN` | `rank_mismatch` |
 | nested / view | one element behind leading axes of 1 | padded the same way | " | `rank_mismatch` |
 
+Note which end the padding goes on: **Eigen pads trailing** — a rank-1 result is
+`Nx1`, so it is read `(i, 0)` — while **nests, mdarrays and Tensors pad
+leading**, so a rank-2 result from rank-3 operands is `(1, m, n)` and is read
+`(0, i, j)`. The same rank-lowering subscript is therefore indexed differently
+depending on the family its operands came from.
+
 A runtime call also caches the lowering it produced, keyed on the operands' shapes *and* strides, so a repeated call of the same shape skips inferring and lowering again. It is a cache, not state: both call operators stay `const`, a copy of the object starts cold, and concurrent calls on one object need external synchronisation.
 
 A subscript whose output is *deeper* than any operand — `"i,j->ij"` from two
@@ -206,11 +212,36 @@ blocking buffers live on the stack below `EIGEN_STACK_ALLOCATION_LIMIT`
 - **A label no other operand has and the output does not want** is summed away
   before the operand enters a contraction, so the GEMM runs over the smallest
   tensor that still answers the subscript.
-- **Contraction order is the subscript's.** `"ij,jk,kl->il"` associates left to
-  right; this library does not reorder, because it has no cost model that would
-  justify doing so.
+- **Contraction order is chosen, not written.** `"ij,jk,kl->il"` is contracted in
+  whichever order costs least, by a greedy search over the pairs: for a thin
+  middle that is left to right, and for a fat one it is not. Pass
+  `path::sequential` to get the subscript's own order back, verbatim:
+  `einsum("ij,jk,kl->il", path::sequential)` or
+  `einsum<"ij,jk,kl->il", path::sequential>()`.
 - **Labels** are `[a-zA-Z]`. Whitespace between them is ignored.
-- **No ellipsis and no broadcasting.** `...` is refused by name.
+- **`...`** stands for the axes a term does not name, at most once per term and
+  at any position within it. The axes it covers are right-aligned across the
+  operands, as NumPy aligns them, so a `(3, 4)` meets a `(5, 3, 4)` on their
+  trailing two. An implicit output puts them first, then the labels seen exactly
+  once in ascending order.
+- **Size-1 broadcasting.** An axis of extent 1 meeting an axis of extent *n*
+  stretches to *n*; the operand is read at one offset for every index along it.
+  Two extents that are neither equal nor 1 are an error: `broadcast_mismatch`
+  for a `...` axis and `extent_conflict` for a named one. A label repeated
+  inside one operand walks a diagonal and must match exactly -- diagonals do not
+  broadcast.
+
+### NumPy parity
+
+| | |
+|---|---|
+| implicit output (once-labels, sorted) | yes |
+| diagonals, traces, partial traces | yes |
+| `...` at any position, right-aligned | yes |
+| size-1 broadcasting | yes |
+| contraction path | greedy by default, `path::sequential` available |
+| sublist form `einsum(op, [0,1], ...)` | no |
+| `dtype` / `casting` / `order` arguments | no |
 
 ### Limits
 
@@ -228,7 +259,7 @@ text lives in a static table that `operator<<` and `std::formatter` read.
 | `errc` | |
 |---|---|
 | `bad_syntax` | the subscript has a character this grammar does not accept |
-| `ellipsis_unsupported` | `...` is not supported: name every axis |
+| `ellipsis_repeated` | a term has more than one `...` |
 | `empty_operand` | an operand between the commas has no labels |
 | `no_operands` | the subscript names no operands |
 | `too_many_operands` | more operands than `kMaxOperands` |
@@ -238,6 +269,8 @@ text lives in a static table that `operator<<` and `std::formatter` read.
 | `operand_count_mismatch` | the subscript and the call disagree on how many operands there are |
 | `rank_mismatch` | an operand's rank differs from the number of labels it was given |
 | `extent_conflict` | one label is bound to two different extents |
+| `broadcast_mismatch` | the `...` dimensions do not broadcast |
+| `ellipsis_not_in_output` | the operands' `...` covers axes the output does not name |
 | `output_mismatch` | the output's rank or extents are not the ones the subscript implies |
 
 ## How it is lowered

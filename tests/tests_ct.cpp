@@ -3,9 +3,10 @@
 // the separate eval()/get_result() step are gone, nothing else about what they
 // assert has changed.
 //
-// Operands here are static-extent mdspans (the view family, which answers a
-// nest of vectors) except where a case is specifically about Eigen or about a
-// nested std::array.
+// Operands here are static-extent mdspans (the view family, which answers an
+// mdarray -- over a std::array when, as here, the extents are in the type)
+// except where a case is specifically about Eigen or about a nested
+// std::array.
 #include "einsum/einsum.hpp"
 
 #include <array>
@@ -27,7 +28,7 @@ namespace {
 // to care which family the subscript happened to produce.
 template <typename A, typename... I>
 [[nodiscard]] auto at(const A &a, const I... idx) {
-  return es::element_at(
+  return es::impl::element_at(
       a, std::array<es::index_t, sizeof...(I)>{static_cast<es::index_t>(idx)...});
 }
 
@@ -621,4 +622,66 @@ BOOST_AUTO_TEST_CASE(EinsumCt_UnrolledProductComputesTheSameAnswer) {
   BOOST_CHECK_LT((*cc - want).cwiseAbs().maxCoeff(), 1e-12);
   BOOST_CHECK_LT((*cr - want).cwiseAbs().maxCoeff(), 1e-12);
   BOOST_CHECK_LT((*rc - want).cwiseAbs().maxCoeff(), 1e-12);
+}
+
+// --- ellipsis and the path, decided at compile time ---------------------------
+namespace {
+
+using MdBatch = std::mdspan<const double, std::extents<std::size_t, 2, 2, 3>>;
+using MdRight3 = std::mdspan<const double, std::extents<std::size_t, 2, 3, 2>>;
+
+// The three-operand chain, whose cheap pair depends on which extents are thin.
+using Thin0 = std::mdspan<const double, std::extents<std::size_t, 2, 100>>;
+using Thin1 = std::mdspan<const double, std::extents<std::size_t, 100, 2>>;
+using Thin2 = std::mdspan<const double, std::extents<std::size_t, 2, 100>>;
+using Fat0 = std::mdspan<const double, std::extents<std::size_t, 100, 2>>;
+using Fat1 = std::mdspan<const double, std::extents<std::size_t, 2, 100>>;
+using Fat2 = std::mdspan<const double, std::extents<std::size_t, 100, 2>>;
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(EinsumCt_EllipsisExpandsAtCompileTime) {
+  const std::vector<double> xs(2 * 2 * 3, 2.0);
+  const std::vector<double> ys(2 * 3 * 2, 3.0);
+  const MdBatch x{xs.data()};
+  const MdRight3 y{ys.data()};
+
+  const auto got = es::einsum<"...ij,...jk->...ik">()(x, y);
+  BOOST_REQUIRE(got.has_value());
+  // The expanded subscript is a constant here, so the result's extents are
+  // exact rather than fitted.
+  static_assert(std::remove_cvref_t<decltype(*got)>::rank() == 3);
+  BOOST_CHECK_EQUAL(got->extent(0), 2U);
+  BOOST_CHECK_EQUAL(got->extent(2), 2U);
+  for (std::size_t b = 0; b < 2; ++b) {
+    for (std::size_t i = 0; i < 2; ++i) {
+      for (std::size_t k = 0; k < 2; ++k) {
+        BOOST_CHECK_LT(std::abs(at(*got, b, i, k) - 3 * 2.0 * 3.0), 1e-12);
+      }
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(EinsumCt_PathIsChosenAtCompileTime) {
+  using Chain = es::StaticEinsum<"ij,jk,kl->il">;
+  using Fat = es::StaticEinsum<"ab,bc,cd->ad">;
+  using Plain = es::StaticEinsum<"ab,bc,cd->ad", es::path::sequential>;
+
+  // A thin middle: the first pair is the cheap one.
+  constexpr es::Path thin =
+      es::impl::einsum_access::static_path<Chain, Thin0, Thin1, Thin2>();
+  static_assert(thin.steps.size() == 2);
+  static_assert(thin.steps[0].l_src == 0 && thin.steps[0].r_src == 1);
+
+  // A fat middle: the last pair is.
+  constexpr es::Path fat = es::impl::einsum_access::static_path<Fat, Fat0, Fat1, Fat2>();
+  static_assert(fat.steps.size() == 2);
+  static_assert(fat.steps[0].l_src == 1 && fat.steps[0].r_src == 2);
+
+  // And the policy is honoured: sequential keeps the subscript's own order even
+  // where it is the dearer one.
+  constexpr es::Path plain = es::impl::einsum_access::static_path<Plain, Fat0, Fat1, Fat2>();
+  static_assert(plain.steps[0].l_src == 0 && plain.steps[0].r_src == 1);
+  static_assert(plain.steps[1].l_src == es::kIntermediate && plain.steps[1].r_src == 2);
+  BOOST_CHECK(true);
 }

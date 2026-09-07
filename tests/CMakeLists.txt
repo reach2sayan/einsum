@@ -38,7 +38,9 @@ set(EINSUM_COMPILE_FAIL_CASES
         compile_fail_operand_count
         "the subscript names a different number of operands than the call passes"
         compile_fail_mixed_kinds
-        "must be one family and one scalar")
+        "must be one family and one scalar"
+        compile_fail_ellipsis_not_in_output
+        "the operands' '...' covers axes the output does not name")
 
 list(LENGTH EINSUM_COMPILE_FAIL_CASES _einsum_case_count)
 math(EXPR _einsum_last "${_einsum_case_count} - 1")

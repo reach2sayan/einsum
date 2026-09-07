@@ -36,17 +36,38 @@ struct Prep {
 // is the pair of axes GEMM iterates over, m/n are the free axes of the two
 // sides, k is what is summed.  Nothing here mentions an extent: a Plan is the
 // shape of the computation, not of the data.
+// Where a step's two sides come from: an operand by index, or the result of an
+// earlier step, which is kIntermediate plus that step's index.  A path chosen by
+// cost does not contract left to right, so a step has to say.
+inline constexpr std::uint8_t kIntermediate = kMaxOperands;
+
 struct Step {
   Labels batch{};
   Labels m{};
   Labels n{};
   Labels k{};
   Labels target{}; // batch ++ m ++ n, the labels of what this step produces
+  std::uint8_t l_src = 0;
+  std::uint8_t r_src = 0;
   bool writes_output = false;
 
   [[nodiscard]] friend constexpr bool
   operator==(const Step &, const Step &) noexcept = default;
 };
+
+// What each label is bound to, and whether anything has bound it yet.  Here
+// rather than in the lowering because a path policy is chosen on extents and
+// must be able to read them.
+struct BoundExtent {
+  index_t extent = 0;
+  bool known = false;
+  bool broadcast = false;
+
+  [[nodiscard]] friend constexpr bool operator==(const BoundExtent &,
+                                                 const BoundExtent &) noexcept = default;
+};
+
+using BoundExtents = impl::LabelTable<BoundExtent>;
 
 class Plan;
 
@@ -84,7 +105,6 @@ private:
 
   Subscripts subs_{};
   impl::FixedVec<Prep, kMaxOperands> preps_{};
-  impl::FixedVec<Step, kMaxOperands - 1> steps_{};
 };
 
 namespace impl {
@@ -93,10 +113,6 @@ struct access {
   [[nodiscard]] static constexpr const FixedVec<Prep, kMaxOperands> &
   preps(const Plan &plan) noexcept {
     return plan.preps_;
-  }
-  [[nodiscard]] static constexpr const FixedVec<Step, kMaxOperands - 1> &
-  steps(const Plan &plan) noexcept {
-    return plan.steps_;
   }
 };
 
@@ -125,9 +141,11 @@ make_prep(const Labels &operand, const Labels &output,
   return prep;
 }
 
-// Left to right, no reassociation: the subscript's order is the caller's
-// choice of contraction order, and a plan that reordered it would be optimising
-// a cost model this library does not have.
+// The subscript and what each operand must do to itself before it can take part
+// -- the diagonals it walks and the axes it sums away.  In what ORDER the
+// operands are then contracted is not decided here: that depends on their
+// extents, which a Plan has never seen, so it belongs to the per-call lowering
+// and to the path policy that drives it.
 [[nodiscard]] constexpr result<Plan>
 make_plan(const Subscripts &subs) noexcept {
   Plan plan;
@@ -142,52 +160,6 @@ make_plan(const Subscripts &subs) noexcept {
       return std::unexpected{prep.error()};
     }
     plan.preps_.push_back(*prep);
-  }
-
-  const std::size_t n = plan.preps_.size();
-  Labels left = plan.preps_[0].labels_after;
-
-  for (const auto i : std::views::iota(std::size_t{1}, n)) {
-    const Labels &right = plan.preps_[i].labels_after;
-
-    // A label is needed past this step if the output wants it or a later
-    // operand still has to meet it; anything else is what k means.
-    const auto needed = [&](const char c) noexcept {
-      if (std::ranges::contains(subs.output, c)) {
-        return true;
-      }
-      return std::ranges::any_of(
-          std::views::iota(i + 1, n), [&](const std::size_t j) {
-            return std::ranges::contains(plan.preps_[j].labels_after, c);
-          });
-    };
-
-    Step step;
-    for (const char c : left) {
-      const bool shared = std::ranges::contains(right, c);
-      auto &group = shared ? (needed(c) ? step.batch : step.k) : step.m;
-      if (!group.try_push_back(c)) {
-        return fail(errc::rank_too_high);
-      }
-    }
-    // Right-only labels are all free: one that nothing later wants would have
-    // been summed away by make_prep, since only this operand could have it.
-    for (const char c : right) {
-      if (!std::ranges::contains(left, c) && !step.n.try_push_back(c)) {
-        return fail(errc::rank_too_high);
-      }
-    }
-
-    for (const Labels *group : {&step.batch, &step.m, &step.n}) {
-      for (const char c : *group) {
-        if (!step.target.try_push_back(c)) {
-          return fail(errc::rank_too_high);
-        }
-      }
-    }
-    step.writes_output = (i + 1 == n);
-    left = step.target;
-    plan.steps_.push_back(step);
   }
 
   return plan;

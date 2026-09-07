@@ -76,7 +76,7 @@ template <typename... Ops> [[nodiscard]] consteval bool all_static() noexcept {
 // The operand's Layout, read entirely from its type.
 template <typename Op>
   requires(is_static<Op>())
-[[nodiscard]] consteval Layout layout_of() noexcept {
+[[nodiscard]] consteval einsum::impl::Layout layout_of() noexcept {
   using B = std::remove_cvref_t<Op>;
   if constexpr (einsum::impl::CEigenDense<B>) {
     const bool row_order =
@@ -87,21 +87,21 @@ template <typename Op>
                                     index_t{B::ColsAtCompileTime}}
                             : Shape{index_t{B::RowsAtCompileTime},
                                     index_t{B::ColsAtCompileTime}};
-    return make_layout(shape, row_order ? row_major : col_major);
+    return einsum::impl::make_layout(shape, row_order ? einsum::impl::row_major : einsum::impl::col_major);
   } else if constexpr (einsum::impl::CMdspanLike<B>) {
     using E = typename B::extents_type;
     Shape shape;
     for (const auto i : std::views::iota(std::size_t{0}, E::rank())) {
       shape.push_back(static_cast<index_t>(E::static_extent(i)));
     }
-    return make_layout(shape,
+    return einsum::impl::make_layout(shape,
                        std::same_as<typename B::layout_type, std::layout_right>
-                           ? row_major
-                           : col_major);
+                           ? einsum::impl::row_major
+                           : einsum::impl::col_major);
   } else {
     Shape shape;
-    impl::static_array_extents<B>(shape);
-    return make_layout(shape, row_major);
+    einsum::ct::impl::static_array_extents<B>(shape);
+    return einsum::impl::make_layout(shape, einsum::impl::row_major);
   }
 }
 
@@ -127,7 +127,7 @@ static_assert(std::same_as<extents_of_t<Shape{}>, std::extents<std::size_t>>);
 // all.  The runtime form of the same thing is an mdarray over dextents and a
 // vector; both are mdarrays, so a caller who moves a call from one path to the
 // other keeps the same indexing.
-template <typename T, Shape S>
+template <einsum::CScalar T, Shape S>
 using static_mdarray_t =
     std::experimental::mdarray<T, extents_of_t<S>, std::layout_right,
                                std::array<T, static_cast<std::size_t>(

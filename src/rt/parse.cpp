@@ -8,6 +8,7 @@
 
 #include <boost/parser/parser.hpp>
 
+#include <cstdint>
 #include <string_view>
 
 // The subscript grammar, and the only translation unit that sees Boost.Parser
@@ -60,6 +61,7 @@ struct Silent {
 struct Building {
   Subscripts subs{};
   Labels current{};
+  std::uint8_t current_ellipsis = kNoEllipsis;
   bool in_output = false;
   errc why = errc::bad_syntax; // what the refusing action meant, if one did
   bool refused = false;
@@ -96,11 +98,28 @@ constexpr auto push_label = [](auto &ctx) {
 
 constexpr auto end_operand = [](auto &ctx) {
   Building &building = _globals(ctx);
-  if (!building.subs.operands.try_push_back(building.current)) {
+  // The labels and the '...' position are one term and are stored together, so
+  // the two vectors cannot fall out of step.
+  if (!building.subs.operands.try_push_back(building.current) ||
+      !building.subs.ellipsis_at.try_push_back(building.current_ellipsis)) {
     refuse<errc::too_many_operands>(ctx);
     return;
   }
   building.current.clear();
+  building.current_ellipsis = kNoEllipsis;
+};
+
+// At most one per term, at whatever position it was written.
+constexpr auto mark_ellipsis = [](auto &ctx) {
+  Building &building = _globals(ctx);
+  std::uint8_t &at =
+      building.in_output ? building.subs.output_ellipsis_at : building.current_ellipsis;
+  if (at != kNoEllipsis) {
+    refuse<errc::ellipsis_repeated>(ctx);
+    return;
+  }
+  at = static_cast<std::uint8_t>(building.in_output ? building.subs.output.size()
+                                                    : building.current.size());
 };
 
 // Fires on the arrow itself, so the labels after it land in the output.
@@ -126,16 +145,17 @@ bp::rule<struct subscript_tag> const subscript = "subscript";
 constexpr auto letter = bp::char_('a', 'z') | bp::char_('A', 'Z');
 
 auto const label_def = letter[act::push_label];
-auto const operand_def = +label;
-auto const ellipsis_def =
-    bp::lit("...")[act::refuse<errc::ellipsis_unsupported>];
+// A term is any mixture of labels and at most one '...', in any order, so that
+// "i...j" and "...ij" and "ij..." all parse and keep their position.
+auto const ellipsis_def = bp::lit("...")[act::mark_ellipsis];
+auto const operand_def = +(label | ellipsis);
 // eps after operand: a comma with nothing between it and the next one is an
 // empty operand, which is a different complaint from "this is not a subscript".
 auto const inputs_def =
     (operand[act::end_operand] | bp::eps[act::refuse<errc::empty_operand>]) %
     ',';
-auto const output_def = bp::lit("->")[act::begin_output] >> *label;
-auto const subscript_def = inputs >> -(ellipsis | output) >> bp::eoi;
+auto const output_def = bp::lit("->")[act::begin_output] >> *(label | ellipsis);
+auto const subscript_def = inputs >> -output >> bp::eoi;
 
 BOOST_PARSER_DEFINE_RULES(label, operand, ellipsis, inputs, output, subscript);
 
@@ -167,11 +187,11 @@ result<Subscripts> parse_subscript(const std::string_view source) noexcept {
   return impl::finish_subscripts(building.subs);
 }
 
-result<Einsum> einsum(const std::string_view source) {
+result<Einsum> einsum(const std::string_view source, const path order) {
   return parse_subscript(source)
       .and_then(impl::make_plan)
-      .transform([](Plan &&plan) {
-        return impl::einsum_access::make<impl::HeapScratch>(std::move(plan));
+      .transform([order](Plan &&plan) {
+        return impl::einsum_access::make<impl::HeapScratch>(std::move(plan), order);
       });
 }
 

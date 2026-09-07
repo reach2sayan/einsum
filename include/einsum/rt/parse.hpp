@@ -1,6 +1,7 @@
 #pragma once
 
 #include "einsum/core/einsum_object.hpp"
+#include "einsum/core/path.hpp"
 #include "einsum/core/plan.hpp"
 #include "einsum/ct/subscripts.hpp"
 #include "einsum/util/error.hpp"
@@ -21,6 +22,7 @@ parse_subscript(std::string_view source) noexcept;
 // The whole pipeline: parse, lower, and hand back the object a caller calls.
 // einsum("ij,jk->ik") -- the runtime half of the entry point; the compile-time
 // half is the einsum<"..."> overload in ct/einsum.hpp.
-[[nodiscard]] EINSUM_API result<Einsum> einsum(std::string_view source);
+[[nodiscard]] EINSUM_API result<Einsum> einsum(std::string_view source,
+                                              path order = path::greedy);
 
 } // namespace einsum

@@ -57,14 +57,14 @@ using CVecMap = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>,
 // A single column has to be column-major and a single row row-major, whatever
 // the operand's own order says; Eigen refuses the other pairing.
 [[nodiscard]] consteval int fixed_order(const index_t rows, const index_t cols,
-                                        const bool row_major) noexcept {
+                                        const bool row_order) noexcept {
   if (cols == 1) {
     return Eigen::ColMajor;
   }
   if (rows == 1) {
     return Eigen::RowMajor;
   }
-  return row_major ? Eigen::RowMajor : Eigen::ColMajor;
+  return row_order ? Eigen::RowMajor : Eigen::ColMajor;
 }
 
 template <CScalar T, index_t R, index_t C, bool RowOrder>

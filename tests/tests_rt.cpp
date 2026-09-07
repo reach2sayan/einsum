@@ -73,8 +73,9 @@ struct NestFamily {
   }
 };
 
-// Row-major storage described by an mdspan: a view family, so the result comes
-// back as a nest of vectors rather than as a view of anything.
+// Row-major storage described by an mdspan: the view family, so the result
+// comes back as an mdarray -- something that owns its elements, since a view
+// cannot -- rather than as a view of anything.
 struct MdspanFamily {
   std::vector<double> buffer;
   std::size_t rows;
@@ -94,8 +95,17 @@ struct MdspanFamily {
     return std::mdspan<const double, std::dextents<std::size_t, 2>>{
         buffer.data(), rows, cols};
   }
-  [[nodiscard]] static Matrix read(const Nest &r) {
-    return NestFamily::read(r);
+  // The view family's result owns its storage: an mdarray, contiguous and
+  // layout_right, rather than the nest the other non-Eigen family answers.
+  template <typename A> [[nodiscard]] static Matrix read(const A &r) {
+    Matrix out(static_cast<index_t>(r.extent(0)),
+               static_cast<index_t>(r.extent(1)));
+    for (std::size_t i = 0; i < r.extent(0); ++i) {
+      for (std::size_t j = 0; j < r.extent(1); ++j) {
+        out(static_cast<index_t>(i), static_cast<index_t>(j)) = r[i, j];
+      }
+    }
+    return out;
   }
 };
 
@@ -131,6 +141,60 @@ BOOST_DATA_TEST_CASE(RtMatmul_MdspanFamily,
 
 // --- the type a call answers
 // --------------------------------------------------
+// Every family's result type in one place.  Each of these is a rule from the
+// spec rather than an observation about the code, and each has been wrong at
+// least once: the view family's mdarray was reintroduced as a nest by an edit
+// meant for another branch, and the assertion that should have caught it had
+// been rewritten to agree.  A single table is harder to quietly amend than a
+// line buried in a behavioural test.
+BOOST_AUTO_TEST_CASE(RtResult_TypeTable) {
+  // Eigen in, an Eigen matrix out, in the operands' own storage order.
+  static_assert(std::same_as<es::result_of_t<Matrix, Matrix>, Matrix>);
+  static_assert(std::same_as<es::result_of_t<Eigen::MatrixXf, Eigen::MatrixXf>,
+                             Eigen::MatrixXf>);
+
+  // A nest deep enough for the result answers its own type, so an einsum over
+  // std::vector nests gives back a std::vector nest.
+  static_assert(std::same_as<es::result_of_t<Nest, Nest>, Nest>);
+  using Nest3 = std::vector<std::vector<std::vector<double>>>;
+  static_assert(std::same_as<es::result_of_t<Nest3, Nest3>, Nest3>);
+
+  // A view owns nothing, so it answers the owning member of its own family --
+  // an mdarray, dynamically sized because the extents are not in the type, and
+  // layout_right because the executor writes into it contiguously.
+  using Md2 = std::mdspan<const double, std::dextents<std::size_t, 2>>;
+  using Md3 = std::mdspan<const double, std::dextents<std::size_t, 3>>;
+  static_assert(
+      std::same_as<es::result_of_t<Md2, Md2>,
+                   std::experimental::mdarray<double, std::dextents<std::size_t, 2>,
+                                              std::layout_right>>);
+  // The rank is the widest operand's, not the first's.
+  static_assert(
+      std::same_as<es::result_of_t<Md2, Md3>,
+                   std::experimental::mdarray<double, std::dextents<std::size_t, 3>,
+                                              std::layout_right>>);
+
+  // A Tensor is its own family: a rank-3 result cannot be a Matrix, and the
+  // type cannot be rebuilt here, so the widest operand's type is the answer.
+  using T3 = Eigen::Tensor<double, 3, Eigen::RowMajor>;
+  using T2 = Eigen::Tensor<double, 2, Eigen::RowMajor>;
+  static_assert(std::same_as<es::result_of_t<T3, T3>, T3>);
+  static_assert(std::same_as<es::result_of_t<T2, T3>, T3>);
+
+  // And the compile-time path, where a static-extent view's extents are known:
+  // the same mdarray, but over a std::array, so the call allocates nothing.
+  const auto fixed = es::einsum<"ij,jk->ik">();
+  std::array<double, 9> xs{};
+  const std::mdspan<const double, std::extents<std::size_t, 3, 3>> x{xs.data()};
+  const auto got = fixed(x, x);
+  static_assert(
+      std::same_as<std::remove_cvref_t<decltype(*got)>,
+                   std::experimental::mdarray<double, std::extents<std::size_t, 3, 3>,
+                                              std::layout_right,
+                                              std::array<double, 9>>>);
+  BOOST_CHECK(got.has_value());
+}
+
 BOOST_AUTO_TEST_CASE(RtResult_FamilyDecidesTheType) {
   const auto plan = es::einsum("ij,jk->ik");
   const Matrix a = sample(4, 5, 1);
@@ -140,13 +204,16 @@ BOOST_AUTO_TEST_CASE(RtResult_FamilyDecidesTheType) {
   BOOST_REQUIRE(eigen.has_value());
   BOOST_CHECK_LT((*eigen - a * b).cwiseAbs().maxCoeff(), 1e-12);
 
-  // A view cannot own a result, so the view family answers a nest of vectors.
+  // A view cannot own a result, so the view family answers the owning member
+  // of its own family -- a dynamic-extent mdarray, not a nest of vectors.
+  using Owned = std::experimental::mdarray<double, std::dextents<std::size_t, 2>,
+                                           std::layout_right>;
   const MdspanFamily left{a};
   const MdspanFamily right{b};
   const auto viewed = (*plan)(left.operand(), right.operand());
-  static_assert(std::same_as<std::remove_cvref_t<decltype(*viewed)>, Nest>);
+  static_assert(std::same_as<std::remove_cvref_t<decltype(*viewed)>, Owned>);
   BOOST_REQUIRE(viewed.has_value());
-  BOOST_CHECK_LT((NestFamily::read(*viewed) - a * b).cwiseAbs().maxCoeff(),
+  BOOST_CHECK_LT((MdspanFamily::read(*viewed) - a * b).cwiseAbs().maxCoeff(),
                  1e-12);
 }
 
@@ -439,4 +506,367 @@ BOOST_AUTO_TEST_CASE(RtObject_IsConstCallableAndRepeatable) {
   BOOST_REQUIRE(first.has_value() && second.has_value());
   BOOST_CHECK_LT((*first - *second).cwiseAbs().maxCoeff(), 1e-15);
   BOOST_CHECK_EQUAL(e.operand_count(), 2U);
+}
+
+// --- ellipsis and broadcasting ------------------------------------------------
+// Everything below is checked against the loop the subscript describes, because
+// a broadcast that silently read the wrong element would still produce numbers.
+
+BOOST_AUTO_TEST_CASE(RtBroadcast_DiagonalIsSquareInItsOwnOperand) {
+  // "i,ii->i" with (5) and (1, 1): the second operand's diagonal IS square, so
+  // it broadcasts to 5 -- the repeat rule is about that operand's own two axes,
+  // not about what the label is bound to elsewhere.
+  const auto plan = es::einsum("i,ii->i");
+  BOOST_REQUIRE(plan.has_value());
+  Eigen::VectorXd a(5);
+  a << 1, 2, 3, 4, 5;
+  Eigen::MatrixXd b(1, 1);
+  b << 2.0;
+  const auto got = (*plan)(a, b);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_EQUAL(got->rows(), 5);
+  for (index_t i = 0; i < 5; ++i) {
+    BOOST_CHECK_LT(std::abs((*got)(i, 0) - a(i) * 2.0), 1e-12);
+  }
+
+  // A diagonal that is not square is still an error, whatever broadcasting the
+  // label does elsewhere.
+  Eigen::MatrixXd oblong(1, 3);
+  oblong.setOnes();
+  BOOST_CHECK(es::failed_with((*plan)(a, oblong), errc::extent_conflict));
+}
+
+BOOST_AUTO_TEST_CASE(RtEllipsis_BatchedMatmulOverTensors) {
+  using T3 = Eigen::Tensor<double, 3, Eigen::RowMajor>;
+  const auto plan = es::einsum("...ij,...jk->...ik");
+  BOOST_REQUIRE(plan.has_value());
+  T3 x(2, 2, 3);
+  T3 y(2, 3, 2);
+  double v = 1.0;
+  for (int b = 0; b < 2; ++b) {
+    for (int i = 0; i < 2; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        x(b, i, j) = v++;
+      }
+    }
+  }
+  v = 1.0;
+  for (int b = 0; b < 2; ++b) {
+    for (int j = 0; j < 3; ++j) {
+      for (int k = 0; k < 2; ++k) {
+        y(b, j, k) = v++;
+      }
+    }
+  }
+  const auto got = (*plan)(x, y);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  for (int b = 0; b < 2; ++b) {
+    for (int i = 0; i < 2; ++i) {
+      for (int k = 0; k < 2; ++k) {
+        double want = 0.0;
+        for (int j = 0; j < 3; ++j) {
+          want += x(b, i, j) * y(b, j, k);
+        }
+        BOOST_CHECK_LT(std::abs((*got)(b, i, k) - want), 1e-12);
+      }
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(RtEllipsis_LeftOnlyAndRightAligned) {
+  // The left operand's '...' covers one axis and the right one has none, so the
+  // broadcast axes are right-aligned: (5, 2, 3) meets (3, 4) on their trailing
+  // axes and the 5 rides along.
+  using T3 = Eigen::Tensor<double, 3, Eigen::RowMajor>;
+  const auto plan = es::einsum("...ij,jk->...ik");
+  BOOST_REQUIRE(plan.has_value());
+  T3 x(5, 2, 3);
+  Eigen::Tensor<double, 2, Eigen::RowMajor> y(3, 4);
+  double v = 1.0;
+  for (int b = 0; b < 5; ++b) {
+    for (int i = 0; i < 2; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        x(b, i, j) = v++;
+      }
+    }
+  }
+  v = 0.5;
+  for (int j = 0; j < 3; ++j) {
+    for (int k = 0; k < 4; ++k) {
+      y(j, k) = v++;
+    }
+  }
+  const auto got = (*plan)(x, y);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  for (int b = 0; b < 5; ++b) {
+    for (int i = 0; i < 2; ++i) {
+      for (int k = 0; k < 4; ++k) {
+        double want = 0.0;
+        for (int j = 0; j < 3; ++j) {
+          want += x(b, i, j) * y(j, k);
+        }
+        BOOST_CHECK_LT(std::abs((*got)(b, i, k) - want), 1e-12);
+      }
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(RtBroadcast_NamedLabelStretches) {
+  // A named label of extent 1 against one of extent 4: the operand is read at
+  // one offset for every index along that axis.
+  const auto plan = es::einsum("ij,ij->ij");
+  BOOST_REQUIRE(plan.has_value());
+  const Nest thin{{2.0}, {3.0}, {4.0}};                 // (3, 1)
+  const Nest wide{{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
+  const auto got = (*plan)(thin, wide);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_EQUAL(got->size(), 3U);
+  BOOST_REQUIRE_EQUAL((*got)[0].size(), 4U);
+  for (std::size_t i = 0; i < 3; ++i) {
+    for (std::size_t j = 0; j < 4; ++j) {
+      BOOST_CHECK_LT(std::abs((*got)[i][j] - thin[i][0] * wide[i][j]), 1e-12);
+    }
+  }
+
+  // Neither equal nor 1 is still a conflict.
+  const Nest other{{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}};
+  BOOST_CHECK(es::failed_with((*plan)(other, wide), errc::extent_conflict));
+}
+
+BOOST_AUTO_TEST_CASE(RtBroadcast_InsideAReducedLabel) {
+  // The same stretch, but the axis is summed away rather than kept.
+  const auto plan = es::einsum("ij,ij->");
+  BOOST_REQUIRE(plan.has_value());
+  const Nest thin{{2.0}, {3.0}, {4.0}};
+  const Nest wide{{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}};
+  const auto got = (*plan)(thin, wide);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  double want = 0.0;
+  for (std::size_t i = 0; i < 3; ++i) {
+    for (std::size_t j = 0; j < 4; ++j) {
+      want += thin[i][0] * wide[i][j];
+    }
+  }
+  BOOST_CHECK_LT(std::abs((*got)[0][0] - want), 1e-12);
+}
+
+BOOST_AUTO_TEST_CASE(RtEllipsis_DiagonalAfterExpansion) {
+  // "...ii->...i": the expansion runs first, and what is left is an ordinary
+  // batched diagonal.
+  using T3 = Eigen::Tensor<double, 3, Eigen::RowMajor>;
+  const auto plan = es::einsum("...ii->...i");
+  BOOST_REQUIRE(plan.has_value());
+  T3 x(2, 3, 3);
+  double v = 1.0;
+  for (int b = 0; b < 2; ++b) {
+    for (int i = 0; i < 3; ++i) {
+      for (int j = 0; j < 3; ++j) {
+        x(b, i, j) = v++;
+      }
+    }
+  }
+  const auto got = (*plan)(x);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+
+  // The contraction is rank 2, but on this path the result TYPE is the widest
+  // operand's -- a rank-3 Tensor -- because the return type cannot see the
+  // subscript.  A lower output rank is padded with leading extents of 1, so the
+  // answer arrives as (1, 2, 3) and is read with that leading index.
+  BOOST_REQUIRE_EQUAL(got->dimension(0), 1);
+  BOOST_REQUIRE_EQUAL(got->dimension(1), 2);
+  BOOST_REQUIRE_EQUAL(got->dimension(2), 3);
+  for (int b = 0; b < 2; ++b) {
+    for (int i = 0; i < 3; ++i) {
+      BOOST_CHECK_LT(std::abs((*got)(0, b, i) - x(b, i, i)), 1e-12);
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(RtEllipsis_OutputMustNameTheBroadcastAxes) {
+  // An explicit output with no '...' while the operands' one covers an axis.
+  const auto plan = es::einsum("...ij,...jk->ik");
+  BOOST_REQUIRE(plan.has_value());
+  using T3 = Eigen::Tensor<double, 3, Eigen::RowMajor>;
+  T3 x(2, 2, 2);
+  T3 y(2, 2, 2);
+  x.setConstant(1.0);
+  y.setConstant(1.0);
+  BOOST_CHECK(es::failed_with((*plan)(x, y), errc::ellipsis_not_in_output));
+
+  // With nothing for it to cover, the same subscript shape is fine.
+  const auto flat = es::einsum("...i->i");
+  BOOST_REQUIRE(flat.has_value());
+  const Eigen::VectorXd v = Eigen::VectorXd::LinSpaced(4, 1.0, 4.0);
+  const auto ok = (*flat)(v);
+  BOOST_REQUIRE_MESSAGE(ok.has_value(), es::message(ok.error().code));
+  BOOST_CHECK_LT((ok->col(0) - v).cwiseAbs().maxCoeff(), 1e-12);
+}
+
+BOOST_AUTO_TEST_CASE(RtBroadcast_MdspanEllipsisStretchesTheBatch) {
+  // The view family under '...': a (1, 2, 3) against a (5, 3, 4).  The left
+  // operand's broadcast axis is 1, so it is read at one offset for all five
+  // batches, and the result is an mdarray of (5, 2, 4).
+  using Md3 = std::mdspan<const double, std::dextents<std::size_t, 3>>;
+  const auto plan = es::einsum("...ij,...jk->...ik");
+  BOOST_REQUIRE(plan.has_value());
+
+  std::vector<double> xs(1 * 2 * 3);
+  std::vector<double> ys(5 * 3 * 4);
+  for (std::size_t n = 0; n < xs.size(); ++n) {
+    xs[n] = static_cast<double>(n) + 1.0;
+  }
+  for (std::size_t n = 0; n < ys.size(); ++n) {
+    ys[n] = static_cast<double>((n * 7) % 11) - 5.0;
+  }
+  const Md3 x{xs.data(), 1, 2, 3};
+  const Md3 y{ys.data(), 5, 3, 4};
+
+  const auto got = (*plan)(x, y);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_EQUAL(got->extent(0), 5U);
+  BOOST_REQUIRE_EQUAL(got->extent(1), 2U);
+  BOOST_REQUIRE_EQUAL(got->extent(2), 4U);
+  for (std::size_t b = 0; b < 5; ++b) {
+    for (std::size_t i = 0; i < 2; ++i) {
+      for (std::size_t k = 0; k < 4; ++k) {
+        double want = 0.0;
+        for (std::size_t j = 0; j < 3; ++j) {
+          want += (x[0, i, j]) * (y[b, j, k]);
+        }
+        BOOST_CHECK_LT(std::abs(((*got)[b, i, k]) - want), 1e-12);
+      }
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(RtBroadcast_StrideZeroOnTheGemmBatchAxis) {
+  // "bij,bjk->bik" with b = 1 on the left and b = 5 on the right.  The stretched
+  // axis is the GEMM's batch, so the left slab is addressed at the same offset
+  // for every batch -- a different path from the hadamard case above, where the
+  // stretched axis is one the kernel iterates elementwise.
+  const auto plan = es::einsum("bij,bjk->bik");
+  BOOST_REQUIRE(plan.has_value());
+
+  std::vector<std::vector<std::vector<double>>> l(
+      1, std::vector<std::vector<double>>(2, std::vector<double>(3, 0.0)));
+  double v = 1.0;
+  for (std::size_t i = 0; i < 2; ++i) {
+    for (std::size_t j = 0; j < 3; ++j) {
+      l[0][i][j] = v++;
+    }
+  }
+  std::vector<std::vector<std::vector<double>>> r(
+      5, std::vector<std::vector<double>>(3, std::vector<double>(4, 0.0)));
+  v = 0.5;
+  for (std::size_t b = 0; b < 5; ++b) {
+    for (std::size_t j = 0; j < 3; ++j) {
+      for (std::size_t k = 0; k < 4; ++k) {
+        r[b][j][k] = v++;
+      }
+    }
+  }
+
+  const auto got = (*plan)(l, r);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_REQUIRE_EQUAL(got->size(), 5U);
+  for (std::size_t b = 0; b < 5; ++b) {
+    for (std::size_t i = 0; i < 2; ++i) {
+      for (std::size_t k = 0; k < 4; ++k) {
+        double want = 0.0;
+        for (std::size_t j = 0; j < 3; ++j) {
+          want += l[0][i][j] * r[b][j][k];
+        }
+        BOOST_CHECK_LT(std::abs((*got)[b][i][k] - want), 1e-12);
+      }
+    }
+  }
+}
+
+// --- the contraction path -----------------------------------------------------
+namespace {
+
+[[nodiscard]] es::BoundExtents extents_of(
+    const std::initializer_list<std::pair<char, index_t>> pairs) {
+  es::BoundExtents bound;
+  for (const auto &[c, e] : pairs) {
+    bound[c] = {.extent = e, .known = true, .broadcast = false};
+  }
+  return bound;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(RtPath_GreedyContractsTheCheapPairFirst) {
+  // A thin middle: (i j)(j k) is a 2x2, so it goes first.
+  const auto thin = es::einsum("ij,jk,kl->il");
+  BOOST_REQUIRE(thin.has_value());
+  const Matrix a = sample(2, 100, 1);
+  const Matrix b = sample(100, 2, 2);
+  const Matrix c = sample(2, 100, 3);
+  const auto got = (*thin)(a, b, c);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), es::message(got.error().code));
+  BOOST_CHECK_LT((*got - a * b * c).cwiseAbs().maxCoeff(), 1e-9);
+
+  const es::Path &chosen = es::impl::einsum_access::last_path(*thin);
+  BOOST_REQUIRE_EQUAL(chosen.steps.size(), 2U);
+  BOOST_CHECK_EQUAL(int{chosen.steps[0].l_src}, 0);
+  BOOST_CHECK_EQUAL(int{chosen.steps[0].r_src}, 1);
+
+  // A fat middle: now the LAST pair is the cheap one.
+  const auto fat = es::einsum("ab,bc,cd->ad");
+  BOOST_REQUIRE(fat.has_value());
+  const Matrix d = sample(100, 2, 1);
+  const Matrix e = sample(2, 100, 2);
+  const Matrix f = sample(100, 2, 3);
+  const auto other = (*fat)(d, e, f);
+  BOOST_REQUIRE_MESSAGE(other.has_value(), es::message(other.error().code));
+  BOOST_CHECK_LT((*other - d * e * f).cwiseAbs().maxCoeff(), 1e-9);
+
+  const es::Path &second = es::impl::einsum_access::last_path(*fat);
+  BOOST_REQUIRE_EQUAL(second.steps.size(), 2U);
+  BOOST_CHECK_EQUAL(int{second.steps[0].l_src}, 1);
+  BOOST_CHECK_EQUAL(int{second.steps[0].r_src}, 2);
+}
+
+BOOST_AUTO_TEST_CASE(RtPath_SequentialIsTheSubscriptsOwnOrder) {
+  const auto plan = es::einsum("ab,bc,cd->ad", es::path::sequential);
+  BOOST_REQUIRE(plan.has_value());
+  BOOST_CHECK(es::impl::einsum_access::order_of(*plan) == es::path::sequential);
+
+  const Matrix d = sample(100, 2, 1);
+  const Matrix e = sample(2, 100, 2);
+  const Matrix f = sample(100, 2, 3);
+  const auto got = (*plan)(d, e, f);
+  BOOST_REQUIRE(got.has_value());
+  BOOST_CHECK_LT((*got - d * e * f).cwiseAbs().maxCoeff(), 1e-9);
+
+  // Left to right, verbatim: operands 0 and 1, then that result with operand 2.
+  const es::Path &chosen = es::impl::einsum_access::last_path(*plan);
+  BOOST_REQUIRE_EQUAL(chosen.steps.size(), 2U);
+  BOOST_CHECK_EQUAL(int{chosen.steps[0].l_src}, 0);
+  BOOST_CHECK_EQUAL(int{chosen.steps[0].r_src}, 1);
+  BOOST_CHECK_EQUAL(int{chosen.steps[1].l_src}, int{es::kIntermediate});
+  BOOST_CHECK_EQUAL(int{chosen.steps[1].r_src}, 2);
+  BOOST_CHECK(chosen.steps[1].writes_output);
+}
+
+BOOST_AUTO_TEST_CASE(RtPath_GreedyIsNeverDearerThanSequential) {
+  const Matrix d = sample(100, 2, 1);
+  const Matrix e = sample(2, 100, 2);
+  const Matrix f = sample(100, 2, 3);
+  const auto bound = extents_of({{'a', 100}, {'b', 2}, {'c', 100}, {'d', 2}});
+
+  const auto greedy = es::einsum("ab,bc,cd->ad", es::path::greedy);
+  const auto step_by_step = es::einsum("ab,bc,cd->ad", es::path::sequential);
+  BOOST_REQUIRE(greedy.has_value() && step_by_step.has_value());
+  const auto one = (*greedy)(d, e, f);
+  const auto two = (*step_by_step)(d, e, f);
+  BOOST_REQUIRE(one.has_value() && two.has_value());
+
+  // The same answer either way, and the chosen order costs no more.
+  BOOST_CHECK_LT((*one - *two).cwiseAbs().maxCoeff(), 1e-9);
+  const auto cheap = es::impl::flops(es::impl::einsum_access::last_path(*greedy), bound);
+  const auto plain = es::impl::flops(es::impl::einsum_access::last_path(*step_by_step), bound);
+  BOOST_CHECK_LE(cheap, plain);
+  BOOST_CHECK_LT(cheap, plain); // on this shape it is strictly better
 }

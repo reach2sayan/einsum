@@ -3,6 +3,7 @@
 #include "einsum/core/execute.hpp"
 #include "einsum/core/kind.hpp"
 #include "einsum/core/lower.hpp"
+#include "einsum/core/path.hpp"
 #include "einsum/core/owned.hpp"
 #include "einsum/core/plan.hpp"
 #include "einsum/core/view.hpp"
@@ -13,6 +14,7 @@
 #include <boost/container/static_vector.hpp>
 
 #include <array>
+#include <concepts>
 #include <cstddef>
 #include <ranges>
 #include <span>
@@ -25,12 +27,11 @@ namespace einsum {
 
 namespace impl {
 
-// --- scratch policies
-// --------------------------------------------------------- The object is
-// immutable: nothing a caller can observe changes between calls. The scratch is
-// therefore not state but a cache, which is what `mutable` is for -- and why
-// both call operators can be const.  It grows to the high-water mark of the
-// calls made through this object and is never shrunk.
+template <typename S>
+concept CScratch = requires(const S &s, std::size_t n) {
+  { s.bytes(n) } -> std::same_as<std::span<std::byte>>;
+};
+
 class HeapScratch {
 public:
   [[nodiscard]] std::span<std::byte> bytes(const std::size_t n) const {
@@ -44,21 +45,13 @@ private:
   mutable std::vector<std::byte> buffer_;
 };
 
-// --- the geometry cache -------------------------------------------------------
-// The lowering depends on the operands' shapes AND strides and on nothing else,
-// so a call whose layouts match the last one's can reuse the Geometry it
-// produced.  Like the scratch this is a cache, not state: it changes nothing a
-// caller can observe, which is why the call operators stay const.
-//
-// Values are never compared and never kept -- only layouts -- so the
-// contraction itself always runs.
-// One address per result type, so a record made for an Eigen result is never
-// handed to a call that wants an mdarray -- two operand layouts can be equal
-// while the results they imply are not.
 template <typename R> inline constexpr char result_id = 0;
 
 struct LastLowering {
   boost::container::static_vector<Layout, kMaxOperands> operands{};
+  // The plan the last call actually ran: the subscript's own, unless it had a
+  // '...', in which case it is the one expanded against those operands' ranks.
+  Plan plan{};
   Shape out_shape{};
   Layout out_layout{};
   Geometry geometry{};
@@ -112,7 +105,7 @@ template <COperand X>
 // matrix holding a rank-1 result is Nx1, and the executor should see one axis,
 // not two.  A fresh result is always densely packed, so the strides follow from
 // the shape and the storage order alone.
-template <typename R>
+template <COperand R>
 [[nodiscard]] constexpr Layout layout_of_result(const Shape &shape) noexcept {
   if constexpr (CEigenTensor<R>) {
     return tensor_layout<R>(shape);
@@ -145,7 +138,13 @@ template <COperand X>
 // where the operand count is a compile-time constant -- the compile-time
 // object -- because at run time it is not, and a trailing non-const Eigen
 // matrix is then indistinguishable from an operand.
-template <typename Tup, std::size_t... I>
+// Enough of a tuple for std::tuple_size, std::tuple_element_t and std::get:
+// both call operators forward their arguments as one, and nothing else is asked
+// of it.
+template <typename Tup>
+concept CTupleLike = requires { std::tuple_size<std::remove_cvref_t<Tup>>::value; };
+
+template <CTupleLike Tup, std::size_t... I>
 [[nodiscard]] consteval bool out_form_over(std::index_sequence<I...>) noexcept {
   using Last = std::tuple_element_t<sizeof...(I), Tup>;
   if constexpr (!std::is_lvalue_reference_v<Last> ||
@@ -164,6 +163,85 @@ template <typename... A> [[nodiscard]] consteval bool is_out_form() noexcept {
       std::make_index_sequence<sizeof...(A) - 1>{});
 }
 
+// --- the one contraction -----------------------------------------------------
+// What both entry points do once the lowering is known.  They differ only in
+// where the block of scratch comes from -- a pooled allocation on the runtime
+// path, an array in the frame on the compile-time one -- and in whether the
+// offsets into it were computed or were constants; both are parameters, so the
+// contraction itself is written once.
+
+// Where each thing sits in that one block: the geometry's own working space
+// first, because execute() addresses it from zero, then a packed copy of every
+// operand the kernels cannot address, then the output when it is not one the
+// result can be written into directly.  `total` is the block's size in
+// elements.  Constexpr, so the static path sizes its frame array with it.
+struct ScratchMap {
+  std::array<index_t, kMaxOperands> packed_at{}; // -1 where nothing is packed
+  index_t out_at = -1;                           // -1 when the output is direct
+  index_t total = 0;
+};
+
+[[nodiscard]] constexpr ScratchMap
+scratch_offsets(const std::span<const Layout> lays,
+                const std::span<const bool> gathered, const index_t scratch_elems,
+                const Shape &out_shape, const bool out_direct) noexcept {
+  ScratchMap map;
+  map.packed_at.fill(-1);
+  index_t cursor = scratch_elems;
+  for (const auto [i, packs] : gathered | std::views::enumerate) {
+    if (packs) {
+      map.packed_at[static_cast<std::size_t>(i)] = cursor;
+      cursor += lays[static_cast<std::size_t>(i)].size();
+    }
+  }
+  if (!out_direct) {
+    map.out_at = cursor;
+    cursor += product(out_shape);
+  }
+  map.total = cursor;
+  return map;
+}
+
+// Pack what has to be packed, contract, and scatter if the result could not be
+// written into directly.  `pool` is the block scratch_offsets() described.
+template <CScalar T, COperand R, COperand... Ops>
+void contract_into(const Plan &plan, const Geometry &geometry,
+                   const std::span<const Layout> lays, const Layout &out_layout,
+                   T *const pool, const ScratchMap &map, R &out,
+                   const Shape &fitted, const Ops &...ops) {
+  boost::container::static_vector<TensorView<const T>, kMaxOperands> views;
+  std::size_t next = 0;
+  const auto prepare = [&](const auto &op) {
+    const T *base = nullptr;
+    if constexpr (CContiguous<decltype(op)>) {
+      base = data_of(op);
+    } else {
+      T *const packed = pool + map.packed_at[next];
+      gather(op, packed, lays[next].shape);
+      base = packed;
+    }
+    views.push_back(TensorView<const T>{base, lays[next]});
+    ++next;
+  };
+  (prepare(ops), ...);
+
+  // if constexpr, not a ternary: the two branches have different pointer types.
+  T *target_data = nullptr;
+  if constexpr (CDirectWritable<R>) {
+    target_data = out.data();
+  } else {
+    target_data = pool + map.out_at;
+  }
+  execute<T>(plan, geometry, std::span<const TensorView<const T>>{views},
+             TensorView<T>{target_data, out_layout},
+             std::span<T>{pool, static_cast<std::size_t>(geometry.scratch_elems)});
+
+  if constexpr (!CDirectWritable<R>) {
+    scatter(static_cast<const T *>(pool + map.out_at), out, fitted);
+  }
+}
+
+
 } // namespace impl
 
 // --- the object
@@ -172,7 +250,7 @@ template <typename... A> [[nodiscard]] consteval bool is_out_form() noexcept {
 // the object is immutable, so one may be shared, stored by value, or made
 // constexpr on the compile-time path.  Concurrent calls on the *same* object
 // still need synchronisation, because they share the scratch cache.
-template <typename Scratch> class BasicEinsum;
+template <impl::CScratch Scratch> class BasicEinsum;
 
 namespace impl {
 // The one way an Einsum is built from a Plan.  A caller never has a Plan --
@@ -181,13 +259,14 @@ namespace impl {
 struct einsum_access;
 } // namespace impl
 
-template <typename Scratch> class BasicEinsum {
+template <impl::CScratch Scratch> class BasicEinsum {
 public:
   // A copy starts cold: the caches belong to the object that warmed them, and
   // sharing them would make two objects that must not interact do so.
-  BasicEinsum(const BasicEinsum &other) : plan_{other.plan_} {}
+  BasicEinsum(const BasicEinsum &other) : plan_{other.plan_}, order_{other.order_} {}
   BasicEinsum &operator=(const BasicEinsum &other) {
     plan_ = other.plan_;
+    order_ = other.order_;
     scratch_ = Scratch{};
     lowering_ = impl::LastLowering{};
     return *this;
@@ -222,14 +301,15 @@ public:
 
 protected:
   BasicEinsum() = default;
-  constexpr explicit BasicEinsum(Plan plan) noexcept : plan_{std::move(plan)} {}
+  constexpr BasicEinsum(Plan plan, const path order) noexcept
+      : plan_{std::move(plan)}, order_{order} {}
   friend struct impl::einsum_access;
 
   // Used by the compile-time object, where arity settles which form a call is.
   // R is the output's own type, not result_of_t of the operands: that is what
   // lets this form name a rank the by-value one cannot reach -- a rank-4 result
   // from rank-2 operands, say, which no operand type could have implied.
-  template <typename Tup, std::size_t... I>
+  template <impl::CTupleLike Tup, std::size_t... I>
   result<void> with_output(Tup tup, std::index_sequence<I...>) const {
     auto &out = std::get<sizeof...(I)>(tup);
     using R = std::remove_cvref_t<decltype(out)>;
@@ -239,10 +319,14 @@ protected:
         .transform([&out](R &&value) noexcept { out = std::move(value); });
   }
 
-  template <typename R, CScalar T, COperand... Ops>
+  template <COperand R, CScalar T, COperand... Ops>
   [[nodiscard]] result<R> evaluate(const Ops &...ops) const;
 
   Plan plan_{};
+  // Which contraction order to choose.  Part of what the object is, not of what
+  // it caches: two objects over one subscript with different orders answer the
+  // same values by different routes.
+  path order_ = path::greedy;
   Scratch scratch_{};
   // Both caches are per-object and are not copied: a copy starts cold, and two
   // threads calling the same object share them, so that needs synchronising.
@@ -254,15 +338,15 @@ protected:
 // result object, then the geometry, then one scratch block, then execute.  Each
 // step's failure is the call's, and every one of them is answered before a
 // single element moves.
-template <typename Scratch>
-template <typename R, CScalar T, COperand... Ops>
+template <impl::CScratch Scratch>
+template <COperand R, CScalar T, COperand... Ops>
 result<R> BasicEinsum<Scratch>::evaluate(const Ops &...ops) const {
   constexpr std::size_t kOperands = sizeof...(Ops);
   if (kOperands != plan_.operand_count()) {
     return fail(errc::operand_count_mismatch);
   }
 
-  const std::array<result<Shape>, kOperands> shapes{shape_of(ops)...};
+  const std::array<result<Shape>, kOperands> shapes{impl::shape_of(ops)...};
   for (const auto &shape : shapes) {
     if (!shape) {
       return propagate<R>(shape.error());
@@ -272,32 +356,50 @@ result<R> BasicEinsum<Scratch>::evaluate(const Ops &...ops) const {
   impl::Layouts lays;
   std::size_t next = 0;
   (lays.push_back(impl::layout_for(ops, *shapes[next++])), ...);
-  const std::span<const Layout> spans{lays};
+  const std::span<const impl::Layout> spans{lays};
 
   // The lowering depends on the operand layouts and on nothing else, so a call
   // whose layouts match the last one's reuses what that produced.  Only the
   // description is cached; the contraction below always runs.
-  constexpr bool kOutDirect = impl::CEigenDense<R> || impl::CEigenTensor<R> ||
-                              impl::CMdarray<R> || rank_v<R> == 1;
+  constexpr bool kOutDirect = CDirectWritable<R>;
   const void *const kind = &impl::result_id<R>;
   if (!lowering_.matches(spans, kind)) {
-    const auto fresh_shape = impl::infer_output_shape(plan_, spans);
+    // A '...' stands for as many axes as the operands turn out to have, so the
+    // subscript is not complete until they arrive.  Without one this expands to
+    // itself; either way the plan that comes out is what the rest of the call
+    // and the executor use.
+    impl::FixedVec<std::uint8_t, kMaxOperands> ranks;
+    for (const impl::Layout &lay : lays) {
+      ranks.push_back(static_cast<std::uint8_t>(lay.rank()));
+    }
+    const auto expanded =
+        impl::expand(plan_.subscripts(), std::span<const std::uint8_t>{ranks});
+    if (!expanded) {
+      return propagate<R>(expanded.error());
+    }
+    const auto fresh_plan = impl::make_plan(*expanded);
+    if (!fresh_plan) {
+      return propagate<R>(fresh_plan.error());
+    }
+    const auto fresh_shape = impl::infer_output_shape(*fresh_plan, spans);
     if (!fresh_shape) {
       return propagate<R>(fresh_shape.error());
     }
-    const Layout fresh_layout = impl::layout_of_result<R>(*fresh_shape);
-    const auto fresh_geometry = impl::make_geometry(plan_, spans, fresh_layout);
+    const impl::Layout fresh_layout = impl::layout_of_result<R>(*fresh_shape);
+    const auto fresh_geometry = impl::make_geometry(*fresh_plan, spans, fresh_layout, order_);
     if (!fresh_geometry) {
       return propagate<R>(fresh_geometry.error());
     }
     lowering_.operands.assign(lays.begin(), lays.end());
+    lowering_.plan = *fresh_plan;
     lowering_.out_shape = *fresh_shape;
     lowering_.out_layout = fresh_layout;
     lowering_.geometry = *fresh_geometry;
     lowering_.result_kind = kind;
   }
+  const Plan &plan = lowering_.plan;
   const Shape &out_shape = lowering_.out_shape;
-  const Layout &out_layout = lowering_.out_layout;
+  const impl::Layout &out_layout = lowering_.out_layout;
   const impl::Geometry &geometry = lowering_.geometry;
 
   auto out = impl::make_like<R>(out_shape);
@@ -306,76 +408,52 @@ result<R> BasicEinsum<Scratch>::evaluate(const Ops &...ops) const {
   }
   // The result's own rank, which the shape above was fitted to; the elements
   // and their order are the same either way, so the executor is unaffected.
-  const auto fitted =
-      impl::fit_shape(out_shape, impl::CEigenDense<R> ? std::size_t{2} : rank_v<R>);
+  const auto fitted = impl::fit_shape(
+      out_shape, impl::CEigenDense<R> ? std::size_t{2} : rank_v<R>);
   if (!fitted) {
     return propagate<R>(fitted.error());
   }
 
-  // One block: the geometry's own scratch first, because its offsets are
-  // relative to what execute() is handed, then a packed copy of every operand
-  // the kernels cannot address, then the output when it is one of them.
-  const auto elems = static_cast<std::size_t>(geometry.scratch_elems);
-  auto cursor = static_cast<index_t>(elems);
-  std::array<index_t, kOperands> packed_at{};
-  next = 0;
-  const auto reserve = [&](const auto &op) {
-    if constexpr (CContiguous<decltype(op)>) {
-      packed_at[next] = -1;
-    } else {
-      packed_at[next] = cursor;
-      cursor += impl::product(*shapes[next]);
-    }
-    ++next;
-  };
-  (reserve(ops), ...);
-  const index_t out_at = kOutDirect ? -1 : cursor;
-  if constexpr (!kOutDirect) {
-    cursor += impl::product(out_shape);
-  }
+  // One block, laid out by the same function the compile-time path uses; the
+  // only difference here is that it is a pooled allocation rather than an array
+  // in the frame, and that its size is not known until now.
+  constexpr std::array<bool, kOperands> kGathered{!impl::CContiguous<Ops>...};
+  const impl::ScratchMap map = impl::scratch_offsets(
+      spans, std::span<const bool>{kGathered}, geometry.scratch_elems, out_shape,
+      kOutDirect);
 
   const std::span<std::byte> block =
-      scratch_.bytes(static_cast<std::size_t>(cursor) * sizeof(T));
+      scratch_.bytes(static_cast<std::size_t>(map.total) * sizeof(T));
   T *const pool = block.empty() ? nullptr : reinterpret_cast<T *>(block.data());
 
-  boost::container::static_vector<TensorView<const T>, kMaxOperands> views;
-  next = 0;
-  const auto prepare = [&](const auto &op) {
-    const T *base = nullptr;
-    if constexpr (CContiguous<decltype(op)>) {
-      base = impl::data_of(op);
-    } else {
-      T *const packed = pool + packed_at[next];
-      gather(op, packed, *shapes[next]);
-      base = packed;
-    }
-    views.push_back(TensorView<const T>{base, lays[next]});
-    ++next;
-  };
-  (prepare(ops), ...);
-
-  // if constexpr, not a ternary: the two branches have different pointer types.
-  T *target_data = nullptr;
-  if constexpr (kOutDirect) {
-    target_data = out->data();
-  } else {
-    target_data = pool + out_at;
-  }
-  const TensorView<T> target{target_data, out_layout};
-  impl::execute<T>(plan_, geometry, std::span<const TensorView<const T>>{views},
-                   target, std::span<T>{pool, elems});
-
-  if constexpr (!kOutDirect) {
-    scatter(static_cast<const T *>(pool + out_at), *out, *fitted);
-  }
+  impl::contract_into<T>(plan, geometry, spans, out_layout, pool, map, *out,
+                         *fitted, ops...);
   return std::move(*out);
 }
 
 namespace impl {
 struct einsum_access {
-  template <typename Scratch>
-  [[nodiscard]] static BasicEinsum<Scratch> make(Plan plan) noexcept {
-    return BasicEinsum<Scratch>{std::move(plan)};
+  template <CScratch Scratch>
+  [[nodiscard]] static BasicEinsum<Scratch> make(Plan plan, const path order) noexcept {
+    return BasicEinsum<Scratch>{std::move(plan), order};
+  }
+
+  // The order an object was built with, and the path its last call chose.  Both
+  // are for tests: neither is on the public surface.
+  template <CScratch Scratch>
+  [[nodiscard]] static path order_of(const BasicEinsum<Scratch> &e) noexcept {
+    return e.order_;
+  }
+  template <CScratch Scratch>
+  [[nodiscard]] static const Path &last_path(const BasicEinsum<Scratch> &e) noexcept {
+    return e.lowering_.geometry.path;
+  }
+
+  // The compile-time counterpart: the path a StaticEinsum would choose for
+  // these operands, which is a constant and so can be asserted rather than run.
+  template <std::derived_from<BasicEinsum<HeapScratch>> E, COperand... Ops>
+  [[nodiscard]] static consteval Path static_path() noexcept {
+    return E::template Lowered<Ops...>::geometry.path;
   }
 };
 } // namespace impl

@@ -34,11 +34,11 @@
 #include <ostream>
 #include <functional>
 #include <utility>
+#include <span>
 #include <Eigen/Core>
 #include <experimental/mdspan>
 #include <memory>
 #include <optional>
-#include <span>
 #include <tuple>
 #include <experimental/mdarray>
 #include <vector>
@@ -63,7 +63,7 @@ namespace einsum::impl {
 //
 // data_ and size_ are public because a structural type has no invariant to
 // protect, and no member may be private.
-template <typename T, std::size_t N> struct FixedVec {
+template <std::copyable T, std::size_t N> struct FixedVec {
   using value_type = T;
   using size_type = std::size_t;
   using difference_type = std::ptrdiff_t;
@@ -215,22 +215,36 @@ using Labels = impl::FixedVec<char, kMaxRank>;
 
 namespace impl {
 
-// Every label there is, in ascending character order -- which is also the order
-// an implicit output is in, so iterating this is what makes "ba" infer "->ab".
+// Every label there is, in the order an implicit output is in, so iterating
+// this is what makes "ba" infer "->ab".  The digits come first and are the
+// synthetic labels an expanded '...' turns into: neither parser accepts a digit
+// from a caller, so they cannot collide with anything written by hand, and
+// putting them first is what makes NumPy's "ellipsis dims, then the once-labels
+// in ascending order" fall out of one walk.
+inline constexpr std::string_view kBroadcastChars = "01234567";
 inline constexpr std::string_view kLabelChars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    "01234567ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 inline constexpr std::size_t kLabelSlots = kLabelChars.size();
 
 [[nodiscard]] constexpr std::size_t label_slot(const char c) noexcept {
-  return c >= 'a' ? static_cast<std::size_t>(c - 'a') + 26
-                  : static_cast<std::size_t>(c - 'A');
+  if (c <= '9') {
+    return static_cast<std::size_t>(c - '0');
+  }
+  return c >= 'a' ? static_cast<std::size_t>(c - 'a') + 34
+                  : static_cast<std::size_t>(c - 'A') + 8;
+}
+
+// Is this one of the labels an expanded '...' produced?  Only they may
+// broadcast against a mismatched extent, and only they print back as '...'.
+[[nodiscard]] constexpr bool is_broadcast_label(const char c) noexcept {
+  return c >= '0' && c <= '9';
 }
 
 // One value per label, indexed by the label itself.  A dense table beats a
 // search, and the parser has already refused every character that is not one.
 // Three things want one -- how many operands mention a label, how often it
 // occurs, and what extent it is bound to -- and this is all three of them.
-template <typename T> struct LabelTable {
+template <std::regular T> struct LabelTable {
   std::array<T, kLabelSlots> slots{};
 
   [[nodiscard]] constexpr T &operator[](const char c) noexcept {
@@ -257,7 +271,7 @@ namespace einsum {
 // clang-format off
 #define EINSUM_ERRC_SEQ                                                                          \
   ((bad_syntax,             "the subscript has a character this grammar does not accept"))       \
-  ((ellipsis_unsupported,   "'...' is not supported: name every axis"))                          \
+  ((ellipsis_repeated,      "a term has more than one '...'"))                                 \
   ((empty_operand,          "an operand between the commas has no labels"))                      \
   ((no_operands,            "the subscript names no operands"))                                  \
   ((too_many_operands,      "more operands than einsum::kMaxOperands"))                          \
@@ -269,6 +283,8 @@ namespace einsum {
   ((operand_count_mismatch, "the subscript and the call disagree on how many operands there are")) \
   ((rank_mismatch,          "an operand's rank differs from the number of labels it was given")) \
   ((extent_conflict,        "one label is bound to two different extents"))                      \
+  ((broadcast_mismatch,     "the '...' dimensions do not broadcast"))                            \
+  ((ellipsis_not_in_output, "the operands' '...' covers axes the output does not name"))         \
   ((output_mismatch,        "the output's rank or extents are not the ones the subscript implies"))
 // clang-format on
 
@@ -490,9 +506,16 @@ namespace einsum {
 // What a subscript says, before any operand has been looked at.  The same
 // struct comes out of the constexpr parser below and out of the Boost.Parser
 // one in src/rt/parse.cpp; tests/tests_parse.cpp checks that they agree.
+// Where a term's '...' sits among its written labels, or kNoEllipsis when it
+// has none.  A position rather than a flag, because "i...j" puts the broadcast
+// axes between the two named ones.
+inline constexpr std::uint8_t kNoEllipsis = 255;
+
 struct Subscripts {
   impl::FixedVec<Labels, kMaxOperands> operands{};
+  impl::FixedVec<std::uint8_t, kMaxOperands> ellipsis_at{};
   Labels output{};
+  std::uint8_t output_ellipsis_at = kNoEllipsis;
   bool explicit_output = false;
 
   [[nodiscard]] friend constexpr bool
@@ -552,9 +575,6 @@ implicit_output(const FixedVec<Labels, kMaxOperands> &operands) noexcept {
 // What neither parser needs a grammar to see.
 [[nodiscard]] constexpr result<void>
 precheck(const std::string_view source) noexcept {
-  if (std::ranges::contains(source, '.')) {
-    return fail(errc::ellipsis_unsupported);
-  }
   const auto blank = [](const char c) noexcept {
     return c == ' ' || c == '\t';
   };
@@ -589,6 +609,13 @@ finish_subscripts(Subscripts subs) noexcept {
   }
   if (!subs.explicit_output) {
     subs.output = implicit_output(subs.operands);
+    // NumPy's rule: the broadcast axes come first, then the labels seen exactly
+    // once.  The count is not known until the operands arrive, so the output
+    // records only that they lead.
+    if (std::ranges::any_of(subs.ellipsis_at,
+                            [](const std::uint8_t at) { return at != kNoEllipsis; })) {
+      subs.output_ellipsis_at = 0;
+    }
     return subs;
   }
   return validate_output(subs).transform([&] noexcept { return subs; });
@@ -602,7 +629,18 @@ parse_subscripts(const std::string_view source) noexcept {
 
   Subscripts subs;
   Labels current;
+  std::uint8_t current_ellipsis = kNoEllipsis;
   bool in_output = false;
+
+  // Closing a term keeps its labels and its '...' position together, which is
+  // the only reason the two vectors stay the same length.
+  const auto close_term = [&]() noexcept {
+    const bool ok = subs.operands.try_push_back(current) &&
+                    subs.ellipsis_at.try_push_back(current_ellipsis);
+    current.clear();
+    current_ellipsis = kNoEllipsis;
+    return ok;
+  };
 
   for (std::size_t i = 0; i < source.size(); ++i) {
     const char c = source[i];
@@ -613,13 +651,12 @@ parse_subscripts(const std::string_view source) noexcept {
       if (in_output || i + 1 >= source.size() || source[i + 1] != '>') {
         return fail(errc::bad_syntax);
       }
-      if (current.empty()) {
+      if (current.empty() && current_ellipsis == kNoEllipsis) {
         return fail(errc::empty_operand);
       }
-      if (!subs.operands.try_push_back(current)) {
+      if (!close_term()) {
         return fail(errc::too_many_operands);
       }
-      current.clear();
       in_output = true;
       subs.explicit_output = true;
       ++i; // the '>' of the arrow
@@ -629,13 +666,26 @@ parse_subscripts(const std::string_view source) noexcept {
       if (in_output) {
         return fail(errc::bad_syntax);
       }
-      if (current.empty()) {
+      if (current.empty() && current_ellipsis == kNoEllipsis) {
         return fail(errc::empty_operand);
       }
-      if (!subs.operands.try_push_back(current)) {
+      if (!close_term()) {
         return fail(errc::too_many_operands);
       }
-      current.clear();
+      continue;
+    }
+    if (c == '.') {
+      // Exactly three, and at most one per term.  Anything else is a typo, not
+      // a shorthand.
+      if (i + 2 >= source.size() || source[i + 1] != '.' || source[i + 2] != '.') {
+        return fail(errc::bad_syntax);
+      }
+      i += 2;
+      std::uint8_t &at = in_output ? subs.output_ellipsis_at : current_ellipsis;
+      if (at != kNoEllipsis) {
+        return fail(errc::ellipsis_repeated);
+      }
+      at = static_cast<std::uint8_t>(in_output ? subs.output.size() : current.size());
       continue;
     }
     if (!is_label(c)) {
@@ -648,14 +698,88 @@ parse_subscripts(const std::string_view source) noexcept {
   }
 
   if (!in_output) {
-    if (current.empty()) {
+    if (current.empty() && current_ellipsis == kNoEllipsis) {
       return fail(errc::empty_operand); // a trailing comma
     }
-    if (!subs.operands.try_push_back(current)) {
+    if (!close_term()) {
       return fail(errc::too_many_operands);
     }
   }
   return finish_subscripts(subs);
+}
+
+// --- expanding '...' ----------------------------------------------------------
+// Every '...' becomes as many synthetic labels as the operand ranks say it
+// stands for, after which nothing downstream knows an ellipsis was ever there.
+// The dimensions are right-aligned across operands, as NumPy aligns them: an
+// operand covering fewer of them takes the LAST of the broadcast labels, so a
+// (3, 4) and a (5, 3, 4) meet on their trailing axes.
+[[nodiscard]] constexpr result<Subscripts>
+expand(const Subscripts &subs, const std::span<const std::uint8_t> ranks) noexcept {
+  if (ranks.size() != subs.operands.size()) {
+    return fail(errc::operand_count_mismatch);
+  }
+
+  // How many axes each '...' stands for, and the widest of them.
+  impl::FixedVec<std::uint8_t, kMaxOperands> covered;
+  std::size_t widest = 0;
+  for (const auto i : std::views::iota(std::size_t{0}, ranks.size())) {
+    const std::size_t named = subs.operands[i].size();
+    if (ranks[i] < named) {
+      return fail(errc::rank_mismatch);
+    }
+    const std::size_t nb = ranks[i] - named;
+    if (subs.ellipsis_at[i] == kNoEllipsis && nb != 0) {
+      return fail(errc::rank_mismatch);
+    }
+    covered.push_back(static_cast<std::uint8_t>(nb));
+    widest = nb > widest ? nb : widest;
+  }
+  if (widest > kMaxRank) {
+    return fail(errc::rank_too_high);
+  }
+
+  if (widest == 0 && subs.output_ellipsis_at == kNoEllipsis) {
+    // Nothing to expand, and nothing that needed naming.
+    return subs;
+  }
+  if (widest > 0 && subs.output_ellipsis_at == kNoEllipsis) {
+    return fail(errc::ellipsis_not_in_output);
+  }
+
+  // Splice the last `nb` broadcast labels in at the ellipsis, keeping the
+  // written labels either side of it in place.
+  const auto splice = [&](const Labels &labels, const std::uint8_t at,
+                          const std::size_t nb) noexcept -> result<Labels> {
+    Labels out;
+    const std::size_t first = widest - nb;
+    for (const auto k : std::views::iota(std::size_t{0}, labels.size() + nb)) {
+      const bool inside = at != kNoEllipsis && k >= at && k < at + nb;
+      const char c = inside ? impl::kBroadcastChars[first + (k - at)]
+                            : labels[k < at ? k : k - nb];
+      if (!out.try_push_back(c)) {
+        return fail(errc::rank_too_high);
+      }
+    }
+    return out;
+  };
+
+  Subscripts out = subs;
+  for (const auto i : std::views::iota(std::size_t{0}, ranks.size())) {
+    const auto term = splice(subs.operands[i], subs.ellipsis_at[i], covered[i]);
+    if (!term) {
+      return std::unexpected{term.error()};
+    }
+    out.operands[i] = *term;
+    out.ellipsis_at[i] = kNoEllipsis;
+  }
+  const auto output = splice(subs.output, subs.output_ellipsis_at, widest);
+  if (!output) {
+    return std::unexpected{output.error()};
+  }
+  out.output = *output;
+  out.output_ellipsis_at = kNoEllipsis;
+  return out;
 }
 
 } // namespace impl
@@ -704,17 +828,38 @@ struct Prep {
 // is the pair of axes GEMM iterates over, m/n are the free axes of the two
 // sides, k is what is summed.  Nothing here mentions an extent: a Plan is the
 // shape of the computation, not of the data.
+// Where a step's two sides come from: an operand by index, or the result of an
+// earlier step, which is kIntermediate plus that step's index.  A path chosen by
+// cost does not contract left to right, so a step has to say.
+inline constexpr std::uint8_t kIntermediate = kMaxOperands;
+
 struct Step {
   Labels batch{};
   Labels m{};
   Labels n{};
   Labels k{};
   Labels target{}; // batch ++ m ++ n, the labels of what this step produces
+  std::uint8_t l_src = 0;
+  std::uint8_t r_src = 0;
   bool writes_output = false;
 
   [[nodiscard]] friend constexpr bool
   operator==(const Step &, const Step &) noexcept = default;
 };
+
+// What each label is bound to, and whether anything has bound it yet.  Here
+// rather than in the lowering because a path policy is chosen on extents and
+// must be able to read them.
+struct BoundExtent {
+  index_t extent = 0;
+  bool known = false;
+  bool broadcast = false;
+
+  [[nodiscard]] friend constexpr bool operator==(const BoundExtent &,
+                                                 const BoundExtent &) noexcept = default;
+};
+
+using BoundExtents = impl::LabelTable<BoundExtent>;
 
 class Plan;
 
@@ -752,7 +897,6 @@ private:
 
   Subscripts subs_{};
   impl::FixedVec<Prep, kMaxOperands> preps_{};
-  impl::FixedVec<Step, kMaxOperands - 1> steps_{};
 };
 
 namespace impl {
@@ -761,10 +905,6 @@ struct access {
   [[nodiscard]] static constexpr const FixedVec<Prep, kMaxOperands> &
   preps(const Plan &plan) noexcept {
     return plan.preps_;
-  }
-  [[nodiscard]] static constexpr const FixedVec<Step, kMaxOperands - 1> &
-  steps(const Plan &plan) noexcept {
-    return plan.steps_;
   }
 };
 
@@ -793,9 +933,11 @@ make_prep(const Labels &operand, const Labels &output,
   return prep;
 }
 
-// Left to right, no reassociation: the subscript's order is the caller's
-// choice of contraction order, and a plan that reordered it would be optimising
-// a cost model this library does not have.
+// The subscript and what each operand must do to itself before it can take part
+// -- the diagonals it walks and the axes it sums away.  In what ORDER the
+// operands are then contracted is not decided here: that depends on their
+// extents, which a Plan has never seen, so it belongs to the per-call lowering
+// and to the path policy that drives it.
 [[nodiscard]] constexpr result<Plan>
 make_plan(const Subscripts &subs) noexcept {
   Plan plan;
@@ -812,52 +954,6 @@ make_plan(const Subscripts &subs) noexcept {
     plan.preps_.push_back(*prep);
   }
 
-  const std::size_t n = plan.preps_.size();
-  Labels left = plan.preps_[0].labels_after;
-
-  for (const auto i : std::views::iota(std::size_t{1}, n)) {
-    const Labels &right = plan.preps_[i].labels_after;
-
-    // A label is needed past this step if the output wants it or a later
-    // operand still has to meet it; anything else is what k means.
-    const auto needed = [&](const char c) noexcept {
-      if (std::ranges::contains(subs.output, c)) {
-        return true;
-      }
-      return std::ranges::any_of(
-          std::views::iota(i + 1, n), [&](const std::size_t j) {
-            return std::ranges::contains(plan.preps_[j].labels_after, c);
-          });
-    };
-
-    Step step;
-    for (const char c : left) {
-      const bool shared = std::ranges::contains(right, c);
-      auto &group = shared ? (needed(c) ? step.batch : step.k) : step.m;
-      if (!group.try_push_back(c)) {
-        return fail(errc::rank_too_high);
-      }
-    }
-    // Right-only labels are all free: one that nothing later wants would have
-    // been summed away by make_prep, since only this operand could have it.
-    for (const char c : right) {
-      if (!std::ranges::contains(left, c) && !step.n.try_push_back(c)) {
-        return fail(errc::rank_too_high);
-      }
-    }
-
-    for (const Labels *group : {&step.batch, &step.m, &step.n}) {
-      for (const char c : *group) {
-        if (!step.target.try_push_back(c)) {
-          return fail(errc::rank_too_high);
-        }
-      }
-    }
-    step.writes_output = (i + 1 == n);
-    left = step.target;
-    plan.steps_.push_back(step);
-  }
-
   return plan;
 }
 
@@ -869,6 +965,244 @@ build_plan(const std::string_view source) noexcept {
   return parse_subscripts(source).and_then(make_plan);
 }
 
+} // namespace impl
+
+} // namespace einsum
+
+// ---- path.hpp ----
+// In what order the operands are contracted.  The subscript says WHAT is
+// summed; this says in which order the binary contractions happen, which the
+// subscript does not constrain and which changes the cost by orders of
+// magnitude: "ij,jk,kl->il" over a thin middle is cheap left to right and dear
+// right to left, and the reverse holds when the middle is fat.
+//
+// The choice is a value, not a policy type: the runtime object stores it and
+// the lowering switches on it, so einsum() stays one non-template type.
+namespace einsum {
+
+// Which order to choose.  greedy is the default because it is the one that is
+// right when the caller has not thought about it.
+enum class path : std::uint8_t { greedy, sequential };
+
+// The chosen order.  A FixedVec rather than a runtime container because a
+// Geometry has to survive into a constant expression on the compile-time path.
+struct Path {
+  impl::FixedVec<Step, kMaxOperands - 1> steps{};
+
+  [[nodiscard]] friend constexpr bool operator==(const Path &, const Path &) noexcept = default;
+};
+
+namespace impl {
+
+// One tensor still waiting to be contracted: what labels it carries and where
+// it came from.
+struct Live {
+  Labels labels{};
+  std::uint8_t src = 0;
+};
+
+// The extent a label is bound to, or 1 for one nothing has bound -- which is
+// the identity for the products below, so an unbound label costs nothing.
+[[nodiscard]] constexpr index_t extent_of(const BoundExtents &bound, const char c) noexcept {
+  return bound[c].known ? bound[c].extent : 1;
+}
+
+[[nodiscard]] constexpr index_t volume(const Labels &labels, const BoundExtents &bound) noexcept {
+  return std::ranges::fold_left(labels, index_t{1}, [&](const index_t acc, const char c) {
+    return acc * extent_of(bound, c);
+  });
+}
+
+// The one classification, shared by every policy: of the labels the two sides
+// carry, those both have and nothing else needs are summed (k), those both have
+// and something still wants are iterated (batch), and the rest are free (m from
+// the left, n from the right).  `rest` is every other live tensor, which is
+// what "something still wants" means once the order is no longer left to right.
+[[nodiscard]] constexpr result<Step> make_step(const Labels &left, const Labels &right,
+                                               const Labels &output,
+                                               const std::span<const Live> rest) noexcept {
+  const auto needed = [&](const char c) noexcept {
+    return std::ranges::contains(output, c) ||
+           std::ranges::any_of(rest, [c](const Live &other) {
+             return std::ranges::contains(other.labels, c);
+           });
+  };
+
+  Step step;
+  for (const char c : left) {
+    const bool shared = std::ranges::contains(right, c);
+    Labels &group = shared ? (needed(c) ? step.batch : step.k) : step.m;
+    if (!group.try_push_back(c)) {
+      return fail(errc::rank_too_high);
+    }
+  }
+  // Right-only labels are all free: one that nothing else wants would have been
+  // summed away by make_prep, since only that operand could have had it.
+  for (const char c : right) {
+    if (!std::ranges::contains(left, c) && !step.n.try_push_back(c)) {
+      return fail(errc::rank_too_high);
+    }
+  }
+  for (const Labels *group : {&step.batch, &step.m, &step.n}) {
+    for (const char c : *group) {
+      if (!step.target.try_push_back(c)) {
+        return fail(errc::rank_too_high);
+      }
+    }
+  }
+  return step;
+}
+
+// Everything live except the two being contracted, which is what make_step has
+// to be told to classify a pair correctly.
+[[nodiscard]] constexpr FixedVec<Live, kMaxOperands>
+others(const FixedVec<Live, kMaxOperands> &live, const std::size_t a,
+       const std::size_t b) noexcept {
+  FixedVec<Live, kMaxOperands> rest;
+  for (const auto i : std::views::iota(std::size_t{0}, live.size())) {
+    if (i != a && i != b) {
+      rest.push_back(live[i]);
+    }
+  }
+  return rest;
+}
+
+// Contract `a` with `b`, record the step, and replace the pair by its result.
+[[nodiscard]] constexpr result<void> take(FixedVec<Live, kMaxOperands> &live, Path &into,
+                                          const Labels &output, const std::size_t a,
+                                          const std::size_t b) noexcept {
+  const auto rest = others(live, a, b);
+  auto step = make_step(live[a].labels, live[b].labels, output, std::span<const Live>{rest});
+  if (!step) {
+    return std::unexpected{step.error()};
+  }
+  step->l_src = live[a].src;
+  step->r_src = live[b].src;
+
+  const Live made{.labels = step->target,
+                  .src = static_cast<std::uint8_t>(kIntermediate + into.steps.size())};
+  if (!into.steps.try_push_back(*step)) {
+    return fail(errc::too_many_operands);
+  }
+
+  // The new tensor takes the front, which is what makes `sequential` accumulate
+  // to the left the way the subscript reads: contracting (0, 1) each turn then
+  // means "what I have so far, with the next operand".  For a cost-chosen path
+  // the position is immaterial.
+  FixedVec<Live, kMaxOperands> next;
+  next.push_back(made);
+  for (const auto i : std::views::iota(std::size_t{0}, live.size())) {
+    if (i != a && i != b) {
+      next.push_back(live[i]);
+    }
+  }
+  live = next;
+  return {};
+}
+
+[[nodiscard]] constexpr FixedVec<Live, kMaxOperands>
+live_from(const std::span<const Labels> operands) noexcept {
+  FixedVec<Live, kMaxOperands> live;
+  for (const auto i : std::views::iota(std::size_t{0}, operands.size())) {
+    live.push_back({.labels = operands[i], .src = static_cast<std::uint8_t>(i)});
+  }
+  return live;
+}
+
+// The last step is the one that writes the caller's output.
+constexpr void mark_last(Path &into) noexcept {
+  if (!into.steps.empty()) {
+    into.steps[into.steps.size() - 1].writes_output = true;
+  }
+}
+
+} // namespace impl
+
+namespace impl {
+
+// The subscript's own order, left to right, no reassociation.  What the library
+// did before there was a choice, kept so that a caller who has tuned a
+// subscript by hand still gets what they wrote.
+[[nodiscard]] constexpr result<Path> sequential_path(const std::span<const Labels> operands,
+                                                     const Labels &output) noexcept {
+  Path chosen;
+  auto live = live_from(operands);
+  while (live.size() > 1) {
+    if (const auto ok = take(live, chosen, output, 0, 1); !ok) {
+      return std::unexpected{ok.error()};
+    }
+  }
+  mark_last(chosen);
+  return chosen;
+}
+
+// opt_einsum's greedy: at each turn contract the pair whose intermediate is
+// cheapest to form, breaking ties towards the pair that sums the most away.
+// Not optimal -- that is exponential -- but it is what turns an "ij,jk,kl->il"
+// with a thin middle from a dense square into two thin products.
+[[nodiscard]] constexpr result<Path> greedy_path(const std::span<const Labels> operands,
+                                                 const Labels &output,
+                                                 const BoundExtents &bound) noexcept {
+  Path chosen;
+  auto live = live_from(operands);
+  while (live.size() > 1) {
+    std::size_t best_a = 0;
+    std::size_t best_b = 1;
+    index_t best_cost = 0;
+    index_t best_removed = 0;
+    bool first = true;
+
+    for (const auto a : std::views::iota(std::size_t{0}, live.size())) {
+      for (const auto b : std::views::iota(a + 1, live.size())) {
+        const auto rest = others(live, a, b);
+        const auto step =
+            make_step(live[a].labels, live[b].labels, output, std::span<const Live>{rest});
+        if (!step) {
+          return std::unexpected{step.error()};
+        }
+        // What the pair costs is the tensor it makes; what it earns is the
+        // labels it sums away.
+        const index_t cost = volume(step->target, bound);
+        const index_t removed = volume(step->k, bound);
+        if (first || cost < best_cost || (cost == best_cost && removed > best_removed)) {
+          best_a = a;
+          best_b = b;
+          best_cost = cost;
+          best_removed = removed;
+          first = false;
+        }
+      }
+    }
+    if (const auto ok = take(live, chosen, output, best_a, best_b); !ok) {
+      return std::unexpected{ok.error()};
+    }
+  }
+  mark_last(chosen);
+  return chosen;
+}
+
+// The one entry point the lowering calls.  Extents rather than raw shapes, and
+// the operands' labels after their diagonals and reductions rather than the
+// Subscripts: both are what the lowering already has in hand, and recomputing
+// either here would be a second place for them to be got wrong.
+[[nodiscard]] constexpr result<Path> choose_path(const path which,
+                                                 const std::span<const Labels> operands,
+                                                 const Labels &output,
+                                                 const BoundExtents &bound) noexcept {
+  return which == path::sequential ? sequential_path(operands, output)
+                                   : greedy_path(operands, output, bound);
+}
+
+} // namespace impl
+
+namespace impl {
+// What a path costs, for the tests and the README table.  The sum over steps of
+// the product of every label the step touches, which is the usual count.
+[[nodiscard]] constexpr index_t flops(const Path &chosen, const BoundExtents &bound) noexcept {
+  return std::ranges::fold_left(chosen.steps, index_t{0}, [&](const index_t acc, const Step &s) {
+    return acc + volume(s.target, bound) * volume(s.k, bound);
+  });
+}
 } // namespace impl
 
 } // namespace einsum
@@ -1054,7 +1388,8 @@ template <COperand X> inline constexpr std::size_t rank_v = rank_of<X>();
 // Four, because there are four answers to "what shall the result be": an Eigen
 // matrix, an Eigen Tensor (which is where a rank-3 result has to live, since a
 // matrix stops at two), a nest of ranges, or -- for a view, which can own
-// nothing -- a nest built for the purpose.  A call is in exactly one.
+// nothing itself -- the owning member of its own family, an mdarray.  A call is
+// in exactly one.
 template <typename X>
 concept CEigenFamily = impl::CEigenDense<std::remove_cvref_t<X>>;
 
@@ -1068,6 +1403,19 @@ concept CViewFamily = impl::CMdspanLike<std::remove_cvref_t<X>>;
 
 template <typename X>
 concept CNestFamily = CNestedIndexable<X>;
+
+// Can the contraction be written straight into this result's own storage?
+// True when its elements are one contiguous run the executor can address: the
+// three owning families that guarantee it, plus any rank-1 result, whose single
+// axis is contiguous whatever holds it.  Anything else is filled through a
+// scratch buffer and scattered afterwards.
+//
+// Named once because both entry points ask it -- BasicEinsum::evaluate and
+// StaticEinsum::Lowered -- and a family added to one spelling but not the other
+// would silently scatter into a buffer the caller never reads.
+template <typename R>
+concept CDirectWritable = impl::CEigenDense<R> || impl::CEigenTensor<R> ||
+                          impl::CMdarray<R> || rank_v<R> == 1;
 
 // One family and one scalar across the call.  Ranks may differ -- "ij,j->i" is
 // a matrix and a vector -- so this is deliberately not "the same type".
@@ -1107,7 +1455,7 @@ using widest_of_t = typename impl::widest_of<std::remove_cvref_t<Ops>...>::type;
 } // namespace einsum
 
 // ---- view.hpp ----
-namespace einsum {
+namespace einsum::impl {
 
 // --- layout policies ---------------------------------------------------------
 // The two orders as types, so a compile-time operand names one and the runtime
@@ -1116,7 +1464,6 @@ enum class layout : std::uint8_t { row_major, col_major };
 inline constexpr layout row_major = layout::row_major;
 inline constexpr layout col_major = layout::col_major;
 
-namespace impl {
 // The two orders are one walk over the axes in opposite directions: the stride
 // of an axis is the product of the extents inside it, and "inside" is the only
 // thing they disagree about.
@@ -1131,7 +1478,6 @@ packed_strides(const Shape &shape, const bool innermost_last) noexcept {
   }
   return out;
 }
-} // namespace impl
 
 struct RowMajor {
   static constexpr layout order = layout::row_major;
@@ -1188,9 +1534,14 @@ template <CLayoutPolicy P>
 // what this replaced, but recomputing the dot product per element cost +82% on
 // a 64x64 transpose and +45% on a batched matmul -- not a price a walk this hot
 // can pay.
+// One index_t per layout: the callback is handed the operands' offsets, so its
+// arity is the operand count and is checked here rather than inside std::apply.
+template <typename> using offset_arg_t = index_t;
+
 template <typename F, typename... L>
   requires(sizeof...(L) >= 1) &&
-          (std::same_as<std::remove_cvref_t<L>, Layout> && ...)
+          (std::same_as<std::remove_cvref_t<L>, Layout> && ...) &&
+          std::invocable<F &, offset_arg_t<L>...>
 constexpr void for_each_offset(F &&fn, const L &...layouts) noexcept {
   constexpr std::size_t kOperands = sizeof...(L);
 
@@ -1242,7 +1593,7 @@ make_layout(const Shape &shape, const layout order = row_major) noexcept {
 // A Tensor's own strides: it is densely packed, and its Layout says which end
 // moves fastest.  ColMajor here means the FIRST index is fastest, which is
 // einsum's col_major.
-template <typename B>
+template <CEigenTensor B>
 [[nodiscard]] constexpr Layout tensor_layout(const Shape &shape) noexcept {
   // Both sides through int: Tensor's Layout is its own unnamed enumeration, and
   // comparing two unrelated enumerations is a warning this build treats as an
@@ -1253,7 +1604,9 @@ template <typename B>
 }
 
 // A pointer and a Layout; non-owning, const-correct through T.
-template <typename T> struct TensorView {
+template <typename T>
+  requires CScalar<std::remove_cv_t<T>>
+struct TensorView {
   using value_type = std::remove_cv_t<T>;
 
   T *data = nullptr;
@@ -1273,7 +1626,6 @@ template <typename T> struct TensorView {
   }
 };
 
-namespace impl {
 template <typename X> inline constexpr bool is_tensor_view_v = false;
 template <typename T>
 inline constexpr bool is_tensor_view_v<TensorView<T>> = true;
@@ -1299,7 +1651,6 @@ template <CEigenDense D>
   }
   return out;
 }
-} // namespace impl
 
 // --- the three normalisations ------------------------------------------------
 // Everything an operand can be reaches TensorView through exactly one of these.
@@ -1335,7 +1686,6 @@ as_view(const std::mdspan<T, E, L, A> &m) noexcept {
 // Extents first, because everything else needs them.  A nest is measured by
 // descending its first element, and every sibling has to agree: a ragged nest
 // is not a tensor, and says so rather than reading past a short row.
-namespace impl {
 
 // Depth D of R, measuring as it descends.  The first node at each level sets
 // that level's extent and every later one is held to it, so a ragged nest is
@@ -1363,7 +1713,6 @@ measure_nest(const X &x, std::array<index_t, R> &ext,
   }
 }
 
-} // namespace impl
 
 template <COperand X>
 [[nodiscard]] constexpr result<Shape> shape_of(const X &x) noexcept {
@@ -1404,7 +1753,6 @@ template <COperand X>
 // One element, whichever way its type spells the accessor.  The rank is in the
 // operand's type even when its extents are not, so the index pack is built
 // once and the three families differ only in how they consume it.
-namespace impl {
 
 template <std::size_t D, typename X, std::size_t R>
 [[nodiscard]] constexpr decltype(auto)
@@ -1416,7 +1764,7 @@ nest_at(X &&x, const std::array<index_t, R> &at) noexcept {
   }
 }
 
-template <typename X, std::size_t R, std::size_t... I>
+template <COperand X, std::size_t R, std::size_t... I>
 [[nodiscard]] constexpr decltype(auto)
 element_at(X &&x, const std::array<index_t, R> &at,
            std::index_sequence<I...>) noexcept {
@@ -1430,7 +1778,6 @@ element_at(X &&x, const std::array<index_t, R> &at,
   }
 }
 
-} // namespace impl
 
 template <COperand X>
 [[nodiscard]] constexpr decltype(auto)
@@ -1483,7 +1830,7 @@ constexpr void scatter(const scalar_of_t<X> *src, X &x,
   }
 }
 
-} // namespace einsum
+} // namespace einsum::impl
 
 // ---- lower.hpp ----
 // Where a Plan meets a set of extents and becomes a sequence of Eigen calls.
@@ -1631,6 +1978,10 @@ struct StepGeom {
 struct Geometry {
   FixedVec<PrepGeom, kMaxOperands> preps{};
   FixedVec<StepGeom, kMaxOperands - 1> steps{};
+  // The order the steps were chosen in.  Kept because it is what a test asks
+  // about; nothing in the execution reads it, since every step already says
+  // where its two sides are.
+  Path path{};
   Shape out_shape{};
   index_t out_size = 1;
   index_t scratch_elems = 0;
@@ -1642,35 +1993,48 @@ struct Geometry {
 };
 
 // --- extent binding ----------------------------------------------------------
-// What each label is bound to, and whether anything has bound it yet.
-struct BoundExtent {
-  index_t extent = 0;
-  bool known = false;
-};
-
-using BoundExtents = LabelTable<BoundExtent>;
-
-// One label, one extent -- which is also what catches "ii" handed a 2x3, since
-// both axes bind the same label.
 [[nodiscard]] constexpr result<BoundExtents>
 bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
   if (inputs.size() != plan.operand_count()) {
     return fail(errc::operand_count_mismatch);
   }
   BoundExtents bound;
-  for (const auto &[input, labels] :
-       std::views::zip(inputs, plan.subscripts().operands)) {
+  for (const auto &[input, labels] : std::views::zip(inputs, plan.subscripts().operands)) {
     if (input.rank() != labels.size()) {
       return fail(errc::rank_mismatch);
     }
-    // One axis, one label, walked together: zip stops at the shorter, and the
-    // rank check above is what guarantees neither is.
+    // A label repeated inside one operand walks a diagonal, and a diagonal has
+    // to be square: only labels meeting ACROSS operands may broadcast.
+    // What THIS operand's axes say, which is a different question from what the
+    // label is bound to across operands: a diagonal has to be square in the
+    // operand that walks it, even where that same label broadcasts elsewhere.
+    LabelTable<bool> seen_here;
+    LabelTable<index_t> extent_here;
     for (const auto &[c, extent] : std::views::zip(labels, input.shape)) {
       BoundExtent &slot = bound[c];
-      if (slot.known && slot.extent != extent) {
-        return fail(errc::extent_conflict);
+      if (seen_here[c]) {
+        if (extent_here[c] != extent) {
+          return fail(errc::extent_conflict);
+        }
+        continue;
       }
-      slot = {.extent = extent, .known = true};
+      seen_here[c] = true;
+      extent_here[c] = extent;
+
+      if (!slot.known) {
+        slot = {.extent = extent, .known = true, .broadcast = false};
+      } else if (slot.extent == extent) {
+        // agreed
+      } else if (extent == 1) {
+        // This operand is stretched along the axis; the extent stands.
+        slot.broadcast = true;
+      } else if (slot.extent == 1) {
+        // Everything so far was stretched; this operand sets the extent.
+        slot.extent = extent;
+        slot.broadcast = true;
+      } else {
+        return fail(is_broadcast_label(c) ? errc::broadcast_mismatch : errc::extent_conflict);
+      }
     }
   }
   return bound;
@@ -1720,8 +2084,8 @@ struct Bump {
 } // namespace detail
 
 [[nodiscard]] constexpr result<Geometry>
-make_geometry(const Plan &plan, const std::span<const Layout> inputs,
-              const Layout &out) noexcept {
+make_geometry(const Plan &plan, const std::span<const Layout> inputs, const Layout &out,
+              const path order = path::greedy) noexcept {
   const auto bound = bind_extents(plan, inputs);
   if (!bound) {
     return std::unexpected{bound.error()};
@@ -1740,6 +2104,7 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
   detail::Bump bump;
 
   // --- the per-operand preparation -------------------------------------------
+  std::size_t oi = 0;
   for (const auto &[input, prep] :
        std::views::zip(inputs, access::preps(plan))) {
     PrepGeom pg;
@@ -1750,9 +2115,15 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
       pg.merged.shape.push_back((*bound)[c].extent);
       pg.merged.strides.push_back(0);
     }
-    for (const auto &[into, stride] :
-         std::views::zip(prep.merged_into, input.strides)) {
-      pg.merged.strides[into] += stride;
+    // A stretched axis contributes no stride: every index along it reads the one
+    // element the operand actually has.  collapse() already refuses a run whose
+    // stride is zero, so such an operand takes the packing path and no kernel
+    // has to know that broadcasting exists.
+    for (const auto &[c, extent, stride, into] :
+         std::views::zip(plan.subscripts().operands[oi], input.shape,
+                         input.strides, prep.merged_into)) {
+      const bool stretched = extent == 1 && (*bound)[c].extent != 1;
+      pg.merged.strides[into] += stretched ? index_t{0} : stride;
     }
 
     for (const auto &[c, extent, stride] : std::views::zip(
@@ -1771,6 +2142,7 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
       pg.after = pg.merged;
     }
     geom.preps.push_back(pg);
+    ++oi;
   }
 
   // --- the one-operand path --------------------------------------------------
@@ -1787,33 +2159,55 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
   }
 
   // --- the steps -------------------------------------------------------------
-  Labels left_labels = access::preps(plan)[0].labels_after;
-  Layout left_layout = geom.preps[0].after;
-  bool left_scratch = geom.preps[0].reduced;
-  index_t left_offset = geom.preps[0].reduced_offset;
-  std::uint8_t left_operand = 0;
+  // Where each live tensor is: the operands first, then one slot per step for
+  // the intermediate it produces.  A path chosen by cost does not contract left
+  // to right, so a step's sides are looked up rather than carried along.
+  struct Source {
+    Labels labels{};
+    Layout layout{};
+    bool scratch = false;
+    index_t offset = 0;
+    std::uint8_t operand = 0;
+  };
+  std::array<Source, 2 * kMaxOperands> sources{};
+  for (const auto i : std::views::iota(std::size_t{0}, inputs.size())) {
+    sources[i] = {.labels = access::preps(plan)[i].labels_after,
+                  .layout = geom.preps[i].after,
+                  .scratch = geom.preps[i].reduced,
+                  .offset = geom.preps[i].reduced_offset,
+                  .operand = static_cast<std::uint8_t>(i)};
+  }
 
-  for (const auto si :
-       std::views::iota(std::size_t{0}, access::steps(plan).size())) {
-    const Step &step = access::steps(plan)[si];
-    const std::size_t ri = si + 1;
-    const Labels &right_labels = access::preps(plan)[ri].labels_after;
-    const Layout &right_layout = geom.preps[ri].after;
+  FixedVec<Labels, kMaxOperands> live_labels;
+  for (const auto i : std::views::iota(std::size_t{0}, inputs.size())) {
+    live_labels.push_back(access::preps(plan)[i].labels_after);
+  }
+  const auto chosen =
+      choose_path(order, std::span<const Labels>{live_labels}, plan.output_labels(), *bound);
+  if (!chosen) {
+    return std::unexpected{chosen.error()};
+  }
+  geom.path = *chosen;
+
+  for (const auto si : std::views::iota(std::size_t{0}, geom.path.steps.size())) {
+    const Step &step = geom.path.steps[si];
+    const Source &left = sources[step.l_src];
+    const Source &right = sources[step.r_src];
 
     StepGeom sg;
-    sg.l = make_slab(detail::pick(left_labels, left_layout, step.batch),
-                     detail::pick(left_labels, left_layout, step.m),
-                     detail::pick(left_labels, left_layout, step.k));
-    sg.r = make_slab(detail::pick(right_labels, right_layout, step.batch),
-                     detail::pick(right_labels, right_layout, step.k),
-                     detail::pick(right_labels, right_layout, step.n));
+    sg.l = make_slab(detail::pick(left.labels, left.layout, step.batch),
+                     detail::pick(left.labels, left.layout, step.m),
+                     detail::pick(left.labels, left.layout, step.k));
+    sg.r = make_slab(detail::pick(right.labels, right.layout, step.batch),
+                     detail::pick(right.labels, right.layout, step.k),
+                     detail::pick(right.labels, right.layout, step.n));
 
-    sg.l_scratch = left_scratch;
-    sg.l_operand = left_operand;
-    sg.l_offset = left_offset;
-    sg.r_scratch = geom.preps[ri].reduced;
-    sg.r_operand = static_cast<std::uint8_t>(ri);
-    sg.r_offset = geom.preps[ri].reduced_offset;
+    sg.l_scratch = left.scratch;
+    sg.l_operand = left.operand;
+    sg.l_offset = left.offset;
+    sg.r_scratch = right.scratch;
+    sg.r_operand = right.operand;
+    sg.r_offset = right.offset;
 
     // The result: the caller's output on the last step, otherwise a fresh
     // contiguous tensor in batch ++ m ++ n order, which is trivially mappable.
@@ -1850,11 +2244,12 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
 
     geom.steps.push_back(sg);
 
-    left_labels = step.target;
-    left_layout = target_layout;
-    left_scratch = sg.out_scratch;
-    left_offset = sg.out_offset;
-    left_operand = 0;
+    // The intermediate this step just made, for whatever step consumes it.
+    sources[kIntermediate + si] = {.labels = step.target,
+                                   .layout = target_layout,
+                                   .scratch = sg.out_scratch,
+                                   .offset = sg.out_offset,
+                                   .operand = 0};
   }
 
   geom.scratch_elems = bump.cursor;
@@ -1909,14 +2304,14 @@ using CVecMap = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>,
 // A single column has to be column-major and a single row row-major, whatever
 // the operand's own order says; Eigen refuses the other pairing.
 [[nodiscard]] consteval int fixed_order(const index_t rows, const index_t cols,
-                                        const bool row_major) noexcept {
+                                        const bool row_order) noexcept {
   if (cols == 1) {
     return Eigen::ColMajor;
   }
   if (rows == 1) {
     return Eigen::RowMajor;
   }
-  return row_major ? Eigen::RowMajor : Eigen::ColMajor;
+  return row_order ? Eigen::RowMajor : Eigen::ColMajor;
 }
 
 template <CScalar T, index_t R, index_t C, bool RowOrder>
@@ -2229,7 +2624,7 @@ fit_shape(const Shape &shape, const std::size_t rank) noexcept {
 // The one place a result is created.  Eigen sizes itself from the shape; a
 // nest resizes level by level; a std::array nest has its extents in its type
 // and can only check them.
-template <typename X>
+template <COperand X>
 [[nodiscard]] result<X> make_like(const Shape &shape) noexcept;
 
 template <std::size_t D, std::size_t R, typename X>
@@ -2255,7 +2650,7 @@ template <std::size_t D, std::size_t R, typename X>
   }
 }
 
-template <typename X>
+template <COperand X>
 [[nodiscard]] result<X> make_like(const Shape &shape) noexcept {
   using B = std::remove_cvref_t<X>;
   if constexpr (CMdarray<B>) {
@@ -2352,16 +2747,18 @@ using nest_of_t = typename nest_of<T, R>::type;
 // its way out of.
 //
 // Eigen answers an Eigen matrix in the first operand's storage order (rank 0,
-// 1 and 2 being 1x1, Nx1 and MxN by Eigen's own convention); the other two
-// families answer a nest of vectors, because a view cannot own a result and a
-// nest already is one.
+// 1 and 2 being 1x1, Nx1 and MxN by Eigen's own convention); a Tensor and a
+// deep-enough nest answer their own type; the view family answers an mdarray,
+// because a view cannot own a result but the family it belongs to owns one that
+// is contiguous -- which is what lets the executor write straight into .data()
+// instead of scattering row by row.
 namespace impl {
 
-template <typename X>
+template <CEigenFamily X>
 inline constexpr int eigen_order_of =
     std::remove_cvref_t<X>::IsRowMajor ? Eigen::RowMajor : Eigen::ColMajor;
 
-template <typename... Ops>
+template <COperand... Ops>
 [[nodiscard]] consteval auto result_probe() noexcept {
   using First = std::remove_cvref_t<first_of_t<Ops...>>;
   using T = scalar_of_t<First>;
@@ -2374,21 +2771,29 @@ template <typename... Ops>
     // without naming Eigen's Tensor header, so the result is the widest operand
     // itself.  An output deeper than that is rank_mismatch, as for array nests.
     return std::type_identity<widest_of_t<Ops...>>{};
+  } else if constexpr (CViewFamily<First>) {
+    // An mdspan, span or pointer cannot own what it points at, so the view
+    // family's result is the owning member of that same family: an mdarray,
+    // dynamically sized here because the extents are not in the operand types.
+    // (StaticEinsum overrides this with a static-extent mdarray when they are.)
+    // Contiguous and layout_right, so the executor writes into .data() direct.
+    return std::type_identity<std::experimental::mdarray<
+        T, std::dextents<std::size_t, kRank>, std::layout_right>>{};
   } else if constexpr (CNestFamily<First> &&
                        rank_v<widest_of_t<Ops...>> == kRank) {
     // A nest that is already the right depth answers its own type, which is
     // what makes an einsum over std::array nests give back a std::array nest.
     return std::type_identity<widest_of_t<Ops...>>{};
   } else {
-    // A view cannot own a result, and a nest shallower than the output needs a
-    // deeper one than it is; both answer the vector nest of that rank.
+    // A nest shallower than the output needs a deeper one than it is, and
+    // answers the vector nest of that rank.
     return std::type_identity<nest_of_t<T, kRank>>{};
   }
 }
 
 } // namespace impl
 
-template <typename... Ops>
+template <COperand... Ops>
   requires CSameFamily<Ops...>
 using result_of_t = typename decltype(impl::result_probe<Ops...>())::type;
 
@@ -2399,12 +2804,11 @@ namespace einsum {
 
 namespace impl {
 
-// --- scratch policies
-// --------------------------------------------------------- The object is
-// immutable: nothing a caller can observe changes between calls. The scratch is
-// therefore not state but a cache, which is what `mutable` is for -- and why
-// both call operators can be const.  It grows to the high-water mark of the
-// calls made through this object and is never shrunk.
+template <typename S>
+concept CScratch = requires(const S &s, std::size_t n) {
+  { s.bytes(n) } -> std::same_as<std::span<std::byte>>;
+};
+
 class HeapScratch {
 public:
   [[nodiscard]] std::span<std::byte> bytes(const std::size_t n) const {
@@ -2418,21 +2822,13 @@ private:
   mutable std::vector<std::byte> buffer_;
 };
 
-// --- the geometry cache -------------------------------------------------------
-// The lowering depends on the operands' shapes AND strides and on nothing else,
-// so a call whose layouts match the last one's can reuse the Geometry it
-// produced.  Like the scratch this is a cache, not state: it changes nothing a
-// caller can observe, which is why the call operators stay const.
-//
-// Values are never compared and never kept -- only layouts -- so the
-// contraction itself always runs.
-// One address per result type, so a record made for an Eigen result is never
-// handed to a call that wants an mdarray -- two operand layouts can be equal
-// while the results they imply are not.
 template <typename R> inline constexpr char result_id = 0;
 
 struct LastLowering {
   boost::container::static_vector<Layout, kMaxOperands> operands{};
+  // The plan the last call actually ran: the subscript's own, unless it had a
+  // '...', in which case it is the one expanded against those operands' ranks.
+  Plan plan{};
   Shape out_shape{};
   Layout out_layout{};
   Geometry geometry{};
@@ -2486,7 +2882,7 @@ template <COperand X>
 // matrix holding a rank-1 result is Nx1, and the executor should see one axis,
 // not two.  A fresh result is always densely packed, so the strides follow from
 // the shape and the storage order alone.
-template <typename R>
+template <COperand R>
 [[nodiscard]] constexpr Layout layout_of_result(const Shape &shape) noexcept {
   if constexpr (CEigenTensor<R>) {
     return tensor_layout<R>(shape);
@@ -2519,7 +2915,13 @@ template <COperand X>
 // where the operand count is a compile-time constant -- the compile-time
 // object -- because at run time it is not, and a trailing non-const Eigen
 // matrix is then indistinguishable from an operand.
-template <typename Tup, std::size_t... I>
+// Enough of a tuple for std::tuple_size, std::tuple_element_t and std::get:
+// both call operators forward their arguments as one, and nothing else is asked
+// of it.
+template <typename Tup>
+concept CTupleLike = requires { std::tuple_size<std::remove_cvref_t<Tup>>::value; };
+
+template <CTupleLike Tup, std::size_t... I>
 [[nodiscard]] consteval bool out_form_over(std::index_sequence<I...>) noexcept {
   using Last = std::tuple_element_t<sizeof...(I), Tup>;
   if constexpr (!std::is_lvalue_reference_v<Last> ||
@@ -2538,6 +2940,85 @@ template <typename... A> [[nodiscard]] consteval bool is_out_form() noexcept {
       std::make_index_sequence<sizeof...(A) - 1>{});
 }
 
+// --- the one contraction -----------------------------------------------------
+// What both entry points do once the lowering is known.  They differ only in
+// where the block of scratch comes from -- a pooled allocation on the runtime
+// path, an array in the frame on the compile-time one -- and in whether the
+// offsets into it were computed or were constants; both are parameters, so the
+// contraction itself is written once.
+
+// Where each thing sits in that one block: the geometry's own working space
+// first, because execute() addresses it from zero, then a packed copy of every
+// operand the kernels cannot address, then the output when it is not one the
+// result can be written into directly.  `total` is the block's size in
+// elements.  Constexpr, so the static path sizes its frame array with it.
+struct ScratchMap {
+  std::array<index_t, kMaxOperands> packed_at{}; // -1 where nothing is packed
+  index_t out_at = -1;                           // -1 when the output is direct
+  index_t total = 0;
+};
+
+[[nodiscard]] constexpr ScratchMap
+scratch_offsets(const std::span<const Layout> lays,
+                const std::span<const bool> gathered, const index_t scratch_elems,
+                const Shape &out_shape, const bool out_direct) noexcept {
+  ScratchMap map;
+  map.packed_at.fill(-1);
+  index_t cursor = scratch_elems;
+  for (const auto [i, packs] : gathered | std::views::enumerate) {
+    if (packs) {
+      map.packed_at[static_cast<std::size_t>(i)] = cursor;
+      cursor += lays[static_cast<std::size_t>(i)].size();
+    }
+  }
+  if (!out_direct) {
+    map.out_at = cursor;
+    cursor += product(out_shape);
+  }
+  map.total = cursor;
+  return map;
+}
+
+// Pack what has to be packed, contract, and scatter if the result could not be
+// written into directly.  `pool` is the block scratch_offsets() described.
+template <CScalar T, COperand R, COperand... Ops>
+void contract_into(const Plan &plan, const Geometry &geometry,
+                   const std::span<const Layout> lays, const Layout &out_layout,
+                   T *const pool, const ScratchMap &map, R &out,
+                   const Shape &fitted, const Ops &...ops) {
+  boost::container::static_vector<TensorView<const T>, kMaxOperands> views;
+  std::size_t next = 0;
+  const auto prepare = [&](const auto &op) {
+    const T *base = nullptr;
+    if constexpr (CContiguous<decltype(op)>) {
+      base = data_of(op);
+    } else {
+      T *const packed = pool + map.packed_at[next];
+      gather(op, packed, lays[next].shape);
+      base = packed;
+    }
+    views.push_back(TensorView<const T>{base, lays[next]});
+    ++next;
+  };
+  (prepare(ops), ...);
+
+  // if constexpr, not a ternary: the two branches have different pointer types.
+  T *target_data = nullptr;
+  if constexpr (CDirectWritable<R>) {
+    target_data = out.data();
+  } else {
+    target_data = pool + map.out_at;
+  }
+  execute<T>(plan, geometry, std::span<const TensorView<const T>>{views},
+             TensorView<T>{target_data, out_layout},
+             std::span<T>{pool, static_cast<std::size_t>(geometry.scratch_elems)});
+
+  if constexpr (!CDirectWritable<R>) {
+    scatter(static_cast<const T *>(pool + map.out_at), out, fitted);
+  }
+}
+
+
 } // namespace impl
 
 // --- the object
@@ -2546,7 +3027,7 @@ template <typename... A> [[nodiscard]] consteval bool is_out_form() noexcept {
 // the object is immutable, so one may be shared, stored by value, or made
 // constexpr on the compile-time path.  Concurrent calls on the *same* object
 // still need synchronisation, because they share the scratch cache.
-template <typename Scratch> class BasicEinsum;
+template <impl::CScratch Scratch> class BasicEinsum;
 
 namespace impl {
 // The one way an Einsum is built from a Plan.  A caller never has a Plan --
@@ -2555,13 +3036,14 @@ namespace impl {
 struct einsum_access;
 } // namespace impl
 
-template <typename Scratch> class BasicEinsum {
+template <impl::CScratch Scratch> class BasicEinsum {
 public:
   // A copy starts cold: the caches belong to the object that warmed them, and
   // sharing them would make two objects that must not interact do so.
-  BasicEinsum(const BasicEinsum &other) : plan_{other.plan_} {}
+  BasicEinsum(const BasicEinsum &other) : plan_{other.plan_}, order_{other.order_} {}
   BasicEinsum &operator=(const BasicEinsum &other) {
     plan_ = other.plan_;
+    order_ = other.order_;
     scratch_ = Scratch{};
     lowering_ = impl::LastLowering{};
     return *this;
@@ -2596,14 +3078,15 @@ public:
 
 protected:
   BasicEinsum() = default;
-  constexpr explicit BasicEinsum(Plan plan) noexcept : plan_{std::move(plan)} {}
+  constexpr BasicEinsum(Plan plan, const path order) noexcept
+      : plan_{std::move(plan)}, order_{order} {}
   friend struct impl::einsum_access;
 
   // Used by the compile-time object, where arity settles which form a call is.
   // R is the output's own type, not result_of_t of the operands: that is what
   // lets this form name a rank the by-value one cannot reach -- a rank-4 result
   // from rank-2 operands, say, which no operand type could have implied.
-  template <typename Tup, std::size_t... I>
+  template <impl::CTupleLike Tup, std::size_t... I>
   result<void> with_output(Tup tup, std::index_sequence<I...>) const {
     auto &out = std::get<sizeof...(I)>(tup);
     using R = std::remove_cvref_t<decltype(out)>;
@@ -2613,10 +3096,14 @@ protected:
         .transform([&out](R &&value) noexcept { out = std::move(value); });
   }
 
-  template <typename R, CScalar T, COperand... Ops>
+  template <COperand R, CScalar T, COperand... Ops>
   [[nodiscard]] result<R> evaluate(const Ops &...ops) const;
 
   Plan plan_{};
+  // Which contraction order to choose.  Part of what the object is, not of what
+  // it caches: two objects over one subscript with different orders answer the
+  // same values by different routes.
+  path order_ = path::greedy;
   Scratch scratch_{};
   // Both caches are per-object and are not copied: a copy starts cold, and two
   // threads calling the same object share them, so that needs synchronising.
@@ -2628,15 +3115,15 @@ protected:
 // result object, then the geometry, then one scratch block, then execute.  Each
 // step's failure is the call's, and every one of them is answered before a
 // single element moves.
-template <typename Scratch>
-template <typename R, CScalar T, COperand... Ops>
+template <impl::CScratch Scratch>
+template <COperand R, CScalar T, COperand... Ops>
 result<R> BasicEinsum<Scratch>::evaluate(const Ops &...ops) const {
   constexpr std::size_t kOperands = sizeof...(Ops);
   if (kOperands != plan_.operand_count()) {
     return fail(errc::operand_count_mismatch);
   }
 
-  const std::array<result<Shape>, kOperands> shapes{shape_of(ops)...};
+  const std::array<result<Shape>, kOperands> shapes{impl::shape_of(ops)...};
   for (const auto &shape : shapes) {
     if (!shape) {
       return propagate<R>(shape.error());
@@ -2646,32 +3133,50 @@ result<R> BasicEinsum<Scratch>::evaluate(const Ops &...ops) const {
   impl::Layouts lays;
   std::size_t next = 0;
   (lays.push_back(impl::layout_for(ops, *shapes[next++])), ...);
-  const std::span<const Layout> spans{lays};
+  const std::span<const impl::Layout> spans{lays};
 
   // The lowering depends on the operand layouts and on nothing else, so a call
   // whose layouts match the last one's reuses what that produced.  Only the
   // description is cached; the contraction below always runs.
-  constexpr bool kOutDirect = impl::CEigenDense<R> || impl::CEigenTensor<R> ||
-                              impl::CMdarray<R> || rank_v<R> == 1;
+  constexpr bool kOutDirect = CDirectWritable<R>;
   const void *const kind = &impl::result_id<R>;
   if (!lowering_.matches(spans, kind)) {
-    const auto fresh_shape = impl::infer_output_shape(plan_, spans);
+    // A '...' stands for as many axes as the operands turn out to have, so the
+    // subscript is not complete until they arrive.  Without one this expands to
+    // itself; either way the plan that comes out is what the rest of the call
+    // and the executor use.
+    impl::FixedVec<std::uint8_t, kMaxOperands> ranks;
+    for (const impl::Layout &lay : lays) {
+      ranks.push_back(static_cast<std::uint8_t>(lay.rank()));
+    }
+    const auto expanded =
+        impl::expand(plan_.subscripts(), std::span<const std::uint8_t>{ranks});
+    if (!expanded) {
+      return propagate<R>(expanded.error());
+    }
+    const auto fresh_plan = impl::make_plan(*expanded);
+    if (!fresh_plan) {
+      return propagate<R>(fresh_plan.error());
+    }
+    const auto fresh_shape = impl::infer_output_shape(*fresh_plan, spans);
     if (!fresh_shape) {
       return propagate<R>(fresh_shape.error());
     }
-    const Layout fresh_layout = impl::layout_of_result<R>(*fresh_shape);
-    const auto fresh_geometry = impl::make_geometry(plan_, spans, fresh_layout);
+    const impl::Layout fresh_layout = impl::layout_of_result<R>(*fresh_shape);
+    const auto fresh_geometry = impl::make_geometry(*fresh_plan, spans, fresh_layout, order_);
     if (!fresh_geometry) {
       return propagate<R>(fresh_geometry.error());
     }
     lowering_.operands.assign(lays.begin(), lays.end());
+    lowering_.plan = *fresh_plan;
     lowering_.out_shape = *fresh_shape;
     lowering_.out_layout = fresh_layout;
     lowering_.geometry = *fresh_geometry;
     lowering_.result_kind = kind;
   }
+  const Plan &plan = lowering_.plan;
   const Shape &out_shape = lowering_.out_shape;
-  const Layout &out_layout = lowering_.out_layout;
+  const impl::Layout &out_layout = lowering_.out_layout;
   const impl::Geometry &geometry = lowering_.geometry;
 
   auto out = impl::make_like<R>(out_shape);
@@ -2680,76 +3185,52 @@ result<R> BasicEinsum<Scratch>::evaluate(const Ops &...ops) const {
   }
   // The result's own rank, which the shape above was fitted to; the elements
   // and their order are the same either way, so the executor is unaffected.
-  const auto fitted =
-      impl::fit_shape(out_shape, impl::CEigenDense<R> ? std::size_t{2} : rank_v<R>);
+  const auto fitted = impl::fit_shape(
+      out_shape, impl::CEigenDense<R> ? std::size_t{2} : rank_v<R>);
   if (!fitted) {
     return propagate<R>(fitted.error());
   }
 
-  // One block: the geometry's own scratch first, because its offsets are
-  // relative to what execute() is handed, then a packed copy of every operand
-  // the kernels cannot address, then the output when it is one of them.
-  const auto elems = static_cast<std::size_t>(geometry.scratch_elems);
-  auto cursor = static_cast<index_t>(elems);
-  std::array<index_t, kOperands> packed_at{};
-  next = 0;
-  const auto reserve = [&](const auto &op) {
-    if constexpr (CContiguous<decltype(op)>) {
-      packed_at[next] = -1;
-    } else {
-      packed_at[next] = cursor;
-      cursor += impl::product(*shapes[next]);
-    }
-    ++next;
-  };
-  (reserve(ops), ...);
-  const index_t out_at = kOutDirect ? -1 : cursor;
-  if constexpr (!kOutDirect) {
-    cursor += impl::product(out_shape);
-  }
+  // One block, laid out by the same function the compile-time path uses; the
+  // only difference here is that it is a pooled allocation rather than an array
+  // in the frame, and that its size is not known until now.
+  constexpr std::array<bool, kOperands> kGathered{!impl::CContiguous<Ops>...};
+  const impl::ScratchMap map = impl::scratch_offsets(
+      spans, std::span<const bool>{kGathered}, geometry.scratch_elems, out_shape,
+      kOutDirect);
 
   const std::span<std::byte> block =
-      scratch_.bytes(static_cast<std::size_t>(cursor) * sizeof(T));
+      scratch_.bytes(static_cast<std::size_t>(map.total) * sizeof(T));
   T *const pool = block.empty() ? nullptr : reinterpret_cast<T *>(block.data());
 
-  boost::container::static_vector<TensorView<const T>, kMaxOperands> views;
-  next = 0;
-  const auto prepare = [&](const auto &op) {
-    const T *base = nullptr;
-    if constexpr (CContiguous<decltype(op)>) {
-      base = impl::data_of(op);
-    } else {
-      T *const packed = pool + packed_at[next];
-      gather(op, packed, *shapes[next]);
-      base = packed;
-    }
-    views.push_back(TensorView<const T>{base, lays[next]});
-    ++next;
-  };
-  (prepare(ops), ...);
-
-  // if constexpr, not a ternary: the two branches have different pointer types.
-  T *target_data = nullptr;
-  if constexpr (kOutDirect) {
-    target_data = out->data();
-  } else {
-    target_data = pool + out_at;
-  }
-  const TensorView<T> target{target_data, out_layout};
-  impl::execute<T>(plan_, geometry, std::span<const TensorView<const T>>{views},
-                   target, std::span<T>{pool, elems});
-
-  if constexpr (!kOutDirect) {
-    scatter(static_cast<const T *>(pool + out_at), *out, *fitted);
-  }
+  impl::contract_into<T>(plan, geometry, spans, out_layout, pool, map, *out,
+                         *fitted, ops...);
   return std::move(*out);
 }
 
 namespace impl {
 struct einsum_access {
-  template <typename Scratch>
-  [[nodiscard]] static BasicEinsum<Scratch> make(Plan plan) noexcept {
-    return BasicEinsum<Scratch>{std::move(plan)};
+  template <CScratch Scratch>
+  [[nodiscard]] static BasicEinsum<Scratch> make(Plan plan, const path order) noexcept {
+    return BasicEinsum<Scratch>{std::move(plan), order};
+  }
+
+  // The order an object was built with, and the path its last call chose.  Both
+  // are for tests: neither is on the public surface.
+  template <CScratch Scratch>
+  [[nodiscard]] static path order_of(const BasicEinsum<Scratch> &e) noexcept {
+    return e.order_;
+  }
+  template <CScratch Scratch>
+  [[nodiscard]] static const Path &last_path(const BasicEinsum<Scratch> &e) noexcept {
+    return e.lowering_.geometry.path;
+  }
+
+  // The compile-time counterpart: the path a StaticEinsum would choose for
+  // these operands, which is a constant and so can be asserted rather than run.
+  template <std::derived_from<BasicEinsum<HeapScratch>> E, COperand... Ops>
+  [[nodiscard]] static consteval Path static_path() noexcept {
+    return E::template Lowered<Ops...>::geometry.path;
   }
 };
 } // namespace impl
@@ -2821,7 +3302,7 @@ template <typename... Ops> [[nodiscard]] consteval bool all_static() noexcept {
 // The operand's Layout, read entirely from its type.
 template <typename Op>
   requires(is_static<Op>())
-[[nodiscard]] consteval Layout layout_of() noexcept {
+[[nodiscard]] consteval einsum::impl::Layout layout_of() noexcept {
   using B = std::remove_cvref_t<Op>;
   if constexpr (einsum::impl::CEigenDense<B>) {
     const bool row_order =
@@ -2832,21 +3313,21 @@ template <typename Op>
                                     index_t{B::ColsAtCompileTime}}
                             : Shape{index_t{B::RowsAtCompileTime},
                                     index_t{B::ColsAtCompileTime}};
-    return make_layout(shape, row_order ? row_major : col_major);
+    return einsum::impl::make_layout(shape, row_order ? einsum::impl::row_major : einsum::impl::col_major);
   } else if constexpr (einsum::impl::CMdspanLike<B>) {
     using E = typename B::extents_type;
     Shape shape;
     for (const auto i : std::views::iota(std::size_t{0}, E::rank())) {
       shape.push_back(static_cast<index_t>(E::static_extent(i)));
     }
-    return make_layout(shape,
+    return einsum::impl::make_layout(shape,
                        std::same_as<typename B::layout_type, std::layout_right>
-                           ? row_major
-                           : col_major);
+                           ? einsum::impl::row_major
+                           : einsum::impl::col_major);
   } else {
     Shape shape;
-    impl::static_array_extents<B>(shape);
-    return make_layout(shape, row_major);
+    einsum::ct::impl::static_array_extents<B>(shape);
+    return einsum::impl::make_layout(shape, einsum::impl::row_major);
   }
 }
 
@@ -2872,7 +3353,7 @@ static_assert(std::same_as<extents_of_t<Shape{}>, std::extents<std::size_t>>);
 // all.  The runtime form of the same thing is an mdarray over dextents and a
 // vector; both are mdarrays, so a caller who moves a call from one path to the
 // other keeps the same indexing.
-template <typename T, Shape S>
+template <einsum::CScalar T, Shape S>
 using static_mdarray_t =
     std::experimental::mdarray<T, extents_of_t<S>, std::layout_right,
                                std::array<T, static_cast<std::size_t>(
@@ -2891,7 +3372,10 @@ namespace einsum {
 // template argument, so every way it can be wrong is a static_assert carrying
 // the sentence the runtime error would have carried -- and so the operand count
 // is a constant, which is what lets this one also take an output.
-template <impl::FixedString S> class StaticEinsum : public Einsum {
+template <impl::FixedString S, path P = path::greedy>
+class StaticEinsum : public Einsum {
+  friend struct einsum::impl::einsum_access;
+
   static constexpr Subscripts kSubscripts = ct::subscripts<S>::value;
 
   static constexpr auto kPlanResult = impl::make_plan(kSubscripts);
@@ -2902,7 +3386,7 @@ template <impl::FixedString S> class StaticEinsum : public Einsum {
 public:
   StaticEinsum() noexcept
       : Einsum{einsum::impl::einsum_access::make<einsum::impl::HeapScratch>(
-            kPlanResult.value_or(Plan{}))} {}
+            kPlanResult.value_or(Plan{}), P)} {}
 
   // A constant here, unlike on the runtime path, which is the whole reason the
   // output form below can exist: one more argument than the subscript names is
@@ -2951,12 +3435,30 @@ private:
   // Every extent is in a type, so the shape, the output layout, the Geometry
   // and the scratch size are all constants, and the scratch is an array in this
   // frame rather than anything the object had to allocate.
-  template <typename... Ops> struct Lowered {
-    static constexpr std::array<Layout, sizeof...(Ops)> layouts{
+  template <COperand... Ops>
+    requires(ct::all_static<Ops...>())
+  struct Lowered {
+    static constexpr std::array<impl::Layout, sizeof...(Ops)> layouts{
         ct::layout_of<Ops>()...};
+
+    // A '...' stands for as many axes as the operands have, and here that is a
+    // constant, so the expanded subscript and the plan built from it are too.
+    static constexpr std::array<std::uint8_t, sizeof...(Ops)> ranks{
+        static_cast<std::uint8_t>(rank_v<Ops>)...};
+    static constexpr auto kExpanded =
+        einsum::impl::expand(kSubscripts, std::span<const std::uint8_t>{ranks});
+#define EINSUM_EXPAND_FAILED(code) failed_with(kExpanded, errc::code)
+    EINSUM_ASSERT_NO_ERROR(EINSUM_EXPAND_FAILED)
+#undef EINSUM_EXPAND_FAILED
+
+    static constexpr auto kLowered = einsum::impl::make_plan(kExpanded.value_or(Subscripts{}));
+#define EINSUM_LOWERED_FAILED(code) failed_with(kLowered, errc::code)
+    EINSUM_ASSERT_NO_ERROR(EINSUM_LOWERED_FAILED)
+#undef EINSUM_LOWERED_FAILED
+    static constexpr Plan plan = kLowered.value_or(Plan{});
+
     static constexpr Shape shape =
-        impl::infer_output_shape(kPlanResult.value_or(Plan{}),
-                                 std::span<const Layout>{layouts})
+        impl::infer_output_shape(plan, std::span<const impl::Layout>{layouts})
             .value_or(Shape{});
 
     // The view family's result is an mdarray either way; here its extents are
@@ -2965,30 +3467,23 @@ private:
         CViewFamily<einsum::impl::first_of_t<Ops...>>,
         ct::static_mdarray_t<scalar_of_t<einsum::impl::first_of_t<Ops...>>, shape>,
         result_of_t<Ops...>>;
-    static constexpr bool direct = impl::CEigenDense<R> || impl::CEigenTensor<R> ||
-                                   impl::CMdarray<R> || rank_v<R> == 1;
-    static constexpr Layout out_layout =
+    static constexpr bool direct = CDirectWritable<R>;
+    static constexpr impl::Layout out_layout =
         einsum::impl::layout_of_result<R>(shape);
     static constexpr impl::Geometry geometry =
-        impl::make_geometry(kPlanResult.value_or(Plan{}),
-                            std::span<const Layout>{layouts}, out_layout)
+        impl::make_geometry(plan, std::span<const impl::Layout>{layouts}, out_layout, P)
             .value_or(impl::Geometry{});
 
     // The scratch the kernels want, then a packed copy of any operand they
-    // cannot address, then the output when it is one of those.
+    // cannot address, then the output when it is one of those -- laid out by
+    // the same function the runtime path uses, but here at compile time, so
+    // `total` sizes an array in the frame and the call allocates nothing.
     static constexpr std::array<bool, sizeof...(Ops)> gathered{
-        !CContiguous<Ops>...};
-    static constexpr index_t packed_bytes = [] {
-      index_t at = geometry.scratch_elems;
-      for (const auto i : std::views::iota(std::size_t{0}, sizeof...(Ops))) {
-        if (gathered[i]) {
-          at += layouts[i].size();
-        }
-      }
-      return at;
-    }();
-    static constexpr index_t total =
-        direct ? packed_bytes : packed_bytes + einsum::impl::product(shape);
+        !impl::CContiguous<Ops>...};
+    static constexpr einsum::impl::ScratchMap map = einsum::impl::scratch_offsets(
+        std::span<const impl::Layout>{layouts}, std::span<const bool>{gathered},
+        geometry.scratch_elems, shape, direct);
+    static constexpr index_t total = map.total;
 
     // One plain mappable GEMM, nothing packed and nothing summed first: the
     // case Eigen can unroll rather than block, which is the whole point of
@@ -3020,7 +3515,8 @@ private:
     }();
   };
 
-  template <typename... Ops>
+  template <COperand... Ops>
+    requires(ct::all_static<Ops...>())
   [[nodiscard]] auto statically(const Ops &...ops) const {
     using L = Lowered<Ops...>;
     using R = typename L::R;
@@ -3057,40 +3553,14 @@ private:
       product(ops...);
       return result<R>{std::move(*out)};
     } else {
-      boost::container::static_vector<TensorView<const T>, kMaxOperands> views;
-      std::size_t next = 0;
-      index_t cursor = L::geometry.scratch_elems;
-      const auto prepare = [&](const auto &op) {
-        const T *base = nullptr;
-        if constexpr (CContiguous<decltype(op)>) {
-          base = einsum::impl::data_of(op);
-        } else {
-          T *const packed = scratch.data() + cursor;
-          gather(op, packed, L::layouts[next].shape);
-          cursor += L::layouts[next].size();
-          base = packed;
-        }
-        views.push_back(TensorView<const T>{base, L::layouts[next]});
-        ++next;
-      };
-      (prepare(ops), ...);
-
-      T *target_data = nullptr;
-      if constexpr (L::direct) {
-        target_data = out->data();
-      } else {
-        target_data = scratch.data() + cursor;
-      }
-      einsum::impl::execute<T>(
-          kPlanResult.value_or(Plan{}), L::geometry,
-          std::span<const TensorView<const T>>{views},
-          TensorView<T>{target_data, L::out_layout},
-          std::span<T>{scratch}.first(
-              static_cast<std::size_t>(L::geometry.scratch_elems)));
-      if constexpr (!L::direct) {
-        const auto fitted = einsum::impl::fit_shape(L::shape, rank_v<R>);
-        scatter(static_cast<const T *>(target_data), *out, *fitted);
-      }
+      // The same contraction the runtime path runs, over a frame array rather
+      // than a pooled block and with offsets that are constants.
+      static constexpr auto kFitted =
+          einsum::impl::fit_shape(L::shape, rank_v<R>).value_or(Shape{});
+      einsum::impl::contract_into<T>(L::plan, L::geometry,
+                                     std::span<const impl::Layout>{L::layouts},
+                                     L::out_layout, scratch.data(), L::map, *out,
+                                     kFitted, ops...);
       return result<R>{std::move(*out)};
     }
   }
@@ -3113,7 +3583,8 @@ public:
 // einsum<"ij,jk->ik">() -- a function template rather than a variable template,
 // so that it and the runtime einsum(std::string_view) are overloads of one name
 // rather than two different kinds of entity, which C++ will not have.
-template <impl::FixedString S> [[nodiscard]] StaticEinsum<S> einsum() noexcept {
+template <impl::FixedString S, path P = path::greedy>
+[[nodiscard]] StaticEinsum<S, P> einsum() noexcept {
   return {};
 }
 

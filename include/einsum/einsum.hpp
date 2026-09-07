@@ -13,6 +13,7 @@
 #include "einsum/core/limits.hpp"
 #include "einsum/core/lower.hpp"
 #include "einsum/core/owned.hpp"
+#include "einsum/core/path.hpp"
 #include "einsum/core/plan.hpp"
 #include "einsum/core/view.hpp"
 #include "einsum/ct/einsum.hpp"

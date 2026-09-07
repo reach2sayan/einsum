@@ -1,12 +1,14 @@
 #pragma once
 
 #include "einsum/core/limits.hpp"
+#include "einsum/core/path.hpp"
 #include "einsum/core/plan.hpp"
 #include "einsum/core/view.hpp"
 #include "einsum/util/error.hpp"
 #include "einsum/util/ranges.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <ranges>
 #include <span>
@@ -156,6 +158,10 @@ struct StepGeom {
 struct Geometry {
   FixedVec<PrepGeom, kMaxOperands> preps{};
   FixedVec<StepGeom, kMaxOperands - 1> steps{};
+  // The order the steps were chosen in.  Kept because it is what a test asks
+  // about; nothing in the execution reads it, since every step already says
+  // where its two sides are.
+  Path path{};
   Shape out_shape{};
   index_t out_size = 1;
   index_t scratch_elems = 0;
@@ -167,35 +173,48 @@ struct Geometry {
 };
 
 // --- extent binding ----------------------------------------------------------
-// What each label is bound to, and whether anything has bound it yet.
-struct BoundExtent {
-  index_t extent = 0;
-  bool known = false;
-};
-
-using BoundExtents = LabelTable<BoundExtent>;
-
-// One label, one extent -- which is also what catches "ii" handed a 2x3, since
-// both axes bind the same label.
 [[nodiscard]] constexpr result<BoundExtents>
 bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
   if (inputs.size() != plan.operand_count()) {
     return fail(errc::operand_count_mismatch);
   }
   BoundExtents bound;
-  for (const auto &[input, labels] :
-       std::views::zip(inputs, plan.subscripts().operands)) {
+  for (const auto &[input, labels] : std::views::zip(inputs, plan.subscripts().operands)) {
     if (input.rank() != labels.size()) {
       return fail(errc::rank_mismatch);
     }
-    // One axis, one label, walked together: zip stops at the shorter, and the
-    // rank check above is what guarantees neither is.
+    // A label repeated inside one operand walks a diagonal, and a diagonal has
+    // to be square: only labels meeting ACROSS operands may broadcast.
+    // What THIS operand's axes say, which is a different question from what the
+    // label is bound to across operands: a diagonal has to be square in the
+    // operand that walks it, even where that same label broadcasts elsewhere.
+    LabelTable<bool> seen_here;
+    LabelTable<index_t> extent_here;
     for (const auto &[c, extent] : std::views::zip(labels, input.shape)) {
       BoundExtent &slot = bound[c];
-      if (slot.known && slot.extent != extent) {
-        return fail(errc::extent_conflict);
+      if (seen_here[c]) {
+        if (extent_here[c] != extent) {
+          return fail(errc::extent_conflict);
+        }
+        continue;
       }
-      slot = {.extent = extent, .known = true};
+      seen_here[c] = true;
+      extent_here[c] = extent;
+
+      if (!slot.known) {
+        slot = {.extent = extent, .known = true, .broadcast = false};
+      } else if (slot.extent == extent) {
+        // agreed
+      } else if (extent == 1) {
+        // This operand is stretched along the axis; the extent stands.
+        slot.broadcast = true;
+      } else if (slot.extent == 1) {
+        // Everything so far was stretched; this operand sets the extent.
+        slot.extent = extent;
+        slot.broadcast = true;
+      } else {
+        return fail(is_broadcast_label(c) ? errc::broadcast_mismatch : errc::extent_conflict);
+      }
     }
   }
   return bound;
@@ -245,8 +264,8 @@ struct Bump {
 } // namespace detail
 
 [[nodiscard]] constexpr result<Geometry>
-make_geometry(const Plan &plan, const std::span<const Layout> inputs,
-              const Layout &out) noexcept {
+make_geometry(const Plan &plan, const std::span<const Layout> inputs, const Layout &out,
+              const path order = path::greedy) noexcept {
   const auto bound = bind_extents(plan, inputs);
   if (!bound) {
     return std::unexpected{bound.error()};
@@ -265,6 +284,7 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
   detail::Bump bump;
 
   // --- the per-operand preparation -------------------------------------------
+  std::size_t oi = 0;
   for (const auto &[input, prep] :
        std::views::zip(inputs, access::preps(plan))) {
     PrepGeom pg;
@@ -275,9 +295,15 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
       pg.merged.shape.push_back((*bound)[c].extent);
       pg.merged.strides.push_back(0);
     }
-    for (const auto &[into, stride] :
-         std::views::zip(prep.merged_into, input.strides)) {
-      pg.merged.strides[into] += stride;
+    // A stretched axis contributes no stride: every index along it reads the one
+    // element the operand actually has.  collapse() already refuses a run whose
+    // stride is zero, so such an operand takes the packing path and no kernel
+    // has to know that broadcasting exists.
+    for (const auto &[c, extent, stride, into] :
+         std::views::zip(plan.subscripts().operands[oi], input.shape,
+                         input.strides, prep.merged_into)) {
+      const bool stretched = extent == 1 && (*bound)[c].extent != 1;
+      pg.merged.strides[into] += stretched ? index_t{0} : stride;
     }
 
     for (const auto &[c, extent, stride] : std::views::zip(
@@ -296,6 +322,7 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
       pg.after = pg.merged;
     }
     geom.preps.push_back(pg);
+    ++oi;
   }
 
   // --- the one-operand path --------------------------------------------------
@@ -312,33 +339,55 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
   }
 
   // --- the steps -------------------------------------------------------------
-  Labels left_labels = access::preps(plan)[0].labels_after;
-  Layout left_layout = geom.preps[0].after;
-  bool left_scratch = geom.preps[0].reduced;
-  index_t left_offset = geom.preps[0].reduced_offset;
-  std::uint8_t left_operand = 0;
+  // Where each live tensor is: the operands first, then one slot per step for
+  // the intermediate it produces.  A path chosen by cost does not contract left
+  // to right, so a step's sides are looked up rather than carried along.
+  struct Source {
+    Labels labels{};
+    Layout layout{};
+    bool scratch = false;
+    index_t offset = 0;
+    std::uint8_t operand = 0;
+  };
+  std::array<Source, 2 * kMaxOperands> sources{};
+  for (const auto i : std::views::iota(std::size_t{0}, inputs.size())) {
+    sources[i] = {.labels = access::preps(plan)[i].labels_after,
+                  .layout = geom.preps[i].after,
+                  .scratch = geom.preps[i].reduced,
+                  .offset = geom.preps[i].reduced_offset,
+                  .operand = static_cast<std::uint8_t>(i)};
+  }
 
-  for (const auto si :
-       std::views::iota(std::size_t{0}, access::steps(plan).size())) {
-    const Step &step = access::steps(plan)[si];
-    const std::size_t ri = si + 1;
-    const Labels &right_labels = access::preps(plan)[ri].labels_after;
-    const Layout &right_layout = geom.preps[ri].after;
+  FixedVec<Labels, kMaxOperands> live_labels;
+  for (const auto i : std::views::iota(std::size_t{0}, inputs.size())) {
+    live_labels.push_back(access::preps(plan)[i].labels_after);
+  }
+  const auto chosen =
+      choose_path(order, std::span<const Labels>{live_labels}, plan.output_labels(), *bound);
+  if (!chosen) {
+    return std::unexpected{chosen.error()};
+  }
+  geom.path = *chosen;
+
+  for (const auto si : std::views::iota(std::size_t{0}, geom.path.steps.size())) {
+    const Step &step = geom.path.steps[si];
+    const Source &left = sources[step.l_src];
+    const Source &right = sources[step.r_src];
 
     StepGeom sg;
-    sg.l = make_slab(detail::pick(left_labels, left_layout, step.batch),
-                     detail::pick(left_labels, left_layout, step.m),
-                     detail::pick(left_labels, left_layout, step.k));
-    sg.r = make_slab(detail::pick(right_labels, right_layout, step.batch),
-                     detail::pick(right_labels, right_layout, step.k),
-                     detail::pick(right_labels, right_layout, step.n));
+    sg.l = make_slab(detail::pick(left.labels, left.layout, step.batch),
+                     detail::pick(left.labels, left.layout, step.m),
+                     detail::pick(left.labels, left.layout, step.k));
+    sg.r = make_slab(detail::pick(right.labels, right.layout, step.batch),
+                     detail::pick(right.labels, right.layout, step.k),
+                     detail::pick(right.labels, right.layout, step.n));
 
-    sg.l_scratch = left_scratch;
-    sg.l_operand = left_operand;
-    sg.l_offset = left_offset;
-    sg.r_scratch = geom.preps[ri].reduced;
-    sg.r_operand = static_cast<std::uint8_t>(ri);
-    sg.r_offset = geom.preps[ri].reduced_offset;
+    sg.l_scratch = left.scratch;
+    sg.l_operand = left.operand;
+    sg.l_offset = left.offset;
+    sg.r_scratch = right.scratch;
+    sg.r_operand = right.operand;
+    sg.r_offset = right.offset;
 
     // The result: the caller's output on the last step, otherwise a fresh
     // contiguous tensor in batch ++ m ++ n order, which is trivially mappable.
@@ -375,11 +424,12 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
 
     geom.steps.push_back(sg);
 
-    left_labels = step.target;
-    left_layout = target_layout;
-    left_scratch = sg.out_scratch;
-    left_offset = sg.out_offset;
-    left_operand = 0;
+    // The intermediate this step just made, for whatever step consumes it.
+    sources[kIntermediate + si] = {.labels = step.target,
+                                   .layout = target_layout,
+                                   .scratch = sg.out_scratch,
+                                   .offset = sg.out_offset,
+                                   .operand = 0};
   }
 
   geom.scratch_elems = bump.cursor;

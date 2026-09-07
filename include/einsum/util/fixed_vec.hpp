@@ -28,7 +28,7 @@ namespace einsum::impl {
 //
 // data_ and size_ are public because a structural type has no invariant to
 // protect, and no member may be private.
-template <typename T, std::size_t N> struct FixedVec {
+template <std::copyable T, std::size_t N> struct FixedVec {
   using value_type = T;
   using size_type = std::size_t;
   using difference_type = std::ptrdiff_t;

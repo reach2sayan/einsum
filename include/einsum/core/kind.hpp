@@ -166,7 +166,8 @@ template <COperand X> inline constexpr std::size_t rank_v = rank_of<X>();
 // Four, because there are four answers to "what shall the result be": an Eigen
 // matrix, an Eigen Tensor (which is where a rank-3 result has to live, since a
 // matrix stops at two), a nest of ranges, or -- for a view, which can own
-// nothing -- a nest built for the purpose.  A call is in exactly one.
+// nothing itself -- the owning member of its own family, an mdarray.  A call is
+// in exactly one.
 template <typename X>
 concept CEigenFamily = impl::CEigenDense<std::remove_cvref_t<X>>;
 
@@ -180,6 +181,19 @@ concept CViewFamily = impl::CMdspanLike<std::remove_cvref_t<X>>;
 
 template <typename X>
 concept CNestFamily = CNestedIndexable<X>;
+
+// Can the contraction be written straight into this result's own storage?
+// True when its elements are one contiguous run the executor can address: the
+// three owning families that guarantee it, plus any rank-1 result, whose single
+// axis is contiguous whatever holds it.  Anything else is filled through a
+// scratch buffer and scattered afterwards.
+//
+// Named once because both entry points ask it -- BasicEinsum::evaluate and
+// StaticEinsum::Lowered -- and a family added to one spelling but not the other
+// would silently scatter into a buffer the caller never reads.
+template <typename R>
+concept CDirectWritable = impl::CEigenDense<R> || impl::CEigenTensor<R> ||
+                          impl::CMdarray<R> || rank_v<R> == 1;
 
 // One family and one scalar across the call.  Ranks may differ -- "ij,j->i" is
 // a matrix and a vector -- so this is deliberately not "the same type".

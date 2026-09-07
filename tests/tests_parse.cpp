@@ -6,6 +6,7 @@
 #include "einsum/ct/subscripts.hpp"
 #include "einsum/rt/parse.hpp"
 
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -35,9 +36,24 @@ expect(const std::initializer_list<std::string_view> operands,
   Subscripts subs;
   for (const std::string_view op : operands) {
     (void)subs.operands.push_back(labels(op));
+    // One entry per term, whether or not that term wrote a '...'.
+    (void)subs.ellipsis_at.push_back(es::kNoEllipsis);
   }
   subs.output = labels(output);
   subs.explicit_output = explicit_output;
+  return subs;
+}
+
+// The same, for a subscript that does write '...': each term's entry is the
+// position the ellipsis stood at among that term's own labels.
+[[nodiscard]] constexpr Subscripts
+with_ellipsis(Subscripts subs, const std::initializer_list<std::uint8_t> at,
+              const std::uint8_t output_at) noexcept {
+  subs.ellipsis_at.clear();
+  for (const std::uint8_t a : at) {
+    (void)subs.ellipsis_at.push_back(a);
+  }
+  subs.output_ellipsis_at = output_at;
   return subs;
 }
 
@@ -65,10 +81,24 @@ static_assert(failed_with(parse_subscripts("ij,,jk"), errc::empty_operand));
 static_assert(failed_with(parse_subscripts("ij-k"), errc::bad_syntax));
 static_assert(failed_with(parse_subscripts("ij->ik!"), errc::bad_syntax));
 static_assert(failed_with(parse_subscripts("i1"), errc::bad_syntax));
-static_assert(failed_with(parse_subscripts("i..."),
-                          errc::ellipsis_unsupported));
-static_assert(failed_with(parse_subscripts("...ij"),
-                          errc::ellipsis_unsupported));
+// '...' is part of the grammar: what the parse keeps is where it stood, and an
+// implicit output puts the broadcast axes first.
+static_assert(*parse_subscripts("i...") ==
+              with_ellipsis(expect({"i"}, "i", false), {1}, 0));
+static_assert(*parse_subscripts("...ij") ==
+              with_ellipsis(expect({"ij"}, "ij", false), {0}, 0));
+static_assert(*parse_subscripts("...i,...i->...i") ==
+              with_ellipsis(expect({"i", "i"}, "i", true), {0, 0}, 0));
+static_assert(failed_with(parse_subscripts("i...j..."),
+                          errc::ellipsis_repeated));
+static_assert(failed_with(parse_subscripts("i.."), errc::bad_syntax));
+// A term may be nothing but a '...': it names no axis of its own, which is not
+// the same as naming none at all, and both parsers have to tell those apart.
+static_assert(*parse_subscripts("...,...") ==
+              with_ellipsis(expect({"", ""}, "", false), {0, 0}, 0));
+// The output has its own at-most-one rule, on the other side of the arrow.
+static_assert(failed_with(parse_subscripts("ij->i...j..."),
+                          errc::ellipsis_repeated));
 static_assert(failed_with(parse_subscripts("abcdefghi"), errc::rank_too_high));
 static_assert(failed_with(parse_subscripts("a,b,c,d,e,f,g,h,i"),
                           errc::too_many_operands));
@@ -108,6 +138,11 @@ constexpr std::string_view kCorpus[]{"ij,jk->ik",
                                      "i1",
                                      "i...",
                                      "...ij",
+                                     "...i,...i->...i",
+                                     "i...j...",
+                                     "i..",
+                                     "...,...",
+                                     "ij->i...j...",
                                      "->ij",
                                      "abcdefghi",
                                      "a,b,c,d,e,f,g,h,i",
