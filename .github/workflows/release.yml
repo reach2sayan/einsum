@@ -5,19 +5,15 @@ on:
     tags:
       - "v*.*.*"
   # The same thing without publishing anything: every job below runs, and the
-  # two that publish -- `release` and `pypi` -- are gated on
-  # `github.ref_type == 'tag'`, so a dispatch on a branch is a full rehearsal
-  # that spends no version number.  Run one after any change to the nuget leg,
-  # to pyproject.toml, to cmake/ or to the pins -- finding out during a tag
-  # means finding out with the tag already public.  The one thing a dispatch
-  # cannot rehearse is the PyPI upload: nuget-login-check mints a key without
-  # spending it, and PyPI has no equivalent.
+  # two that publish are gated on `github.ref_type == 'tag'`, so a dispatch on a
+  # branch is a full rehearsal that spends no version number.  Run one after any
+  # change to the nuget leg, to pyproject.toml, to cmake/ or to the pins --
+  # finding out during a tag means finding out with the tag already public.
   workflow_dispatch:
 
-# Narrow by default.  The publishing jobs widen it for themselves: `id-token:
-# write` is what NuGet/login and PyPI's trusted publishing exchange for a
-# short-lived key, and granting it at the top would hand it to the wheel builds
-# as well.
+# Narrow by default.  The publishing job widens it for itself: `id-token: write`
+# is what NuGet/login exchanges for a short-lived key, and granting it at the
+# top would hand it to the wheel builds as well.
 permissions:
   contents: read
 
@@ -273,38 +269,3 @@ jobs:
           dotnet nuget push dist/*.nupkg \
             --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
             --source https://api.nuget.org/v3/index.json
-
-  # What `pip install einsum-cpp` in the README resolves against.  Its own job
-  # and not a step in the one above, so a PyPI outage cannot lose the GitHub
-  # Release the wheels are already attached to, and so `id-token: write` is
-  # granted to the upload alone.
-  #
-  # A pattern here, unlike the download above: the wheels belong on PyPI and the
-  # .nupkg does not, and an unfiltered dist/ would offer it one.
-  #
-  # No sdist.  This tree needs libstdc++'s C++23 <expected> and
-  # std::views::enumerate, or MSVC 19.38 -- so a source build is GCC 14+ or
-  # Visual Studio 17.8+, and there is no macOS wheel because Apple Clang has
-  # neither.  An sdist on PyPI would hand exactly those users a compile that
-  # fails deep in a template instead of pip saying, in one line, that no wheel
-  # matches their platform.
-  #
-  # PYPI_PUBLISH gates it the way NUGET_USER gates the steps above: unset, this
-  # is inert, which is what a fork and an account without trusted publishing
-  # configured should get.  The value is not read -- PyPI's publisher policy is
-  # keyed on this repository and this workflow's filename, which is the second
-  # reason renaming this file breaks publishing.
-  pypi:
-    if: github.ref_type == 'tag' && vars.PYPI_PUBLISH != ''
-    needs: [ version, wheels ]
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: wheels-*
-          path: dist
-          merge-multiple: true
-
-      - uses: pypa/gh-action-pypi-publish@v1.14.2
