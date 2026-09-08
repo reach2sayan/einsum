@@ -23,7 +23,8 @@ dependencies = ["numpy>=1.23"]
 # pybind11 is a build dependency above, where the wheel build gets it in an
 # isolated environment.  It is here as well because the `python` CMake preset
 # builds in-tree against this virtualenv and asks the interpreter for it.
-dev = ["pybind11>=3.0", "pytest>=8", "pybind11-stubgen>=2.5", "numpy>=1.23"]
+dev = ["pybind11>=3.0", "pytest>=8", "pybind11-stubgen>=2.5", "numpy>=1.23",
+       "mypy>=1.11"]
 
 # One version, CMake's: `project(einsum VERSION ...)` is where the
 # number is written, and test_package.py checks the module against the same line.
