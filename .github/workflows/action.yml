@@ -200,7 +200,6 @@ jobs:
   python-windows:
     name: python bindings (Windows)
     runs-on: windows-2022
-    continue-on-error: true
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
@@ -216,12 +215,18 @@ jobs:
 
       - uses: astral-sh/setup-uv@v5
 
+      # Two directories: C:/d for the preset build below, C:/dw for the wheel
+      # scikit-build-core builds after it.  Its own key, and not the MSVC job's
+      # deps-msvc-: that job caches C:/d alone, and an exact hit on a shared key
+      # is a cache that is never written back -- C:/dw would download every run.
       - name: Cache the pinned dependencies
         uses: actions/cache@v4
         with:
-          path: C:/d
-          key: deps-msvc-${{ hashFiles('cmake/EinsumDependencies.cmake') }}
-          restore-keys: deps-msvc-
+          path: |
+            C:/d
+            C:/dw
+          key: deps-msvc-py-${{ hashFiles('cmake/EinsumDependencies.cmake') }}
+          restore-keys: deps-msvc-py-
 
       - name: Python environment
         run: uv sync --group dev --no-install-project
@@ -239,8 +244,20 @@ jobs:
       # `git diff --exit-code` on a generated .pyi is a line-ending coin flip
       # carrying no portability signal.  The Linux job already answers it.
 
+      # CMAKE_ARGS, because scikit-build-core configures a tree of its own and
+      # the -D on the Configure step reaches only the preset build.  Without it
+      # the default EINSUM_DEPS_DIR applies -- the workspace .deps, which
+      # nothing caches -- so this step re-downloads 130 MB of Boost on every
+      # run, into the long path C:/d exists to avoid, and a GitHub 500 on the
+      # release asset is enough to fail the job.  C:/dw and not C:/d: this tree
+      # is scikit-build-core's, which picks the Visual Studio generator, and a
+      # FetchContent subbuild directory remembers the generator that configured
+      # it -- pointing both at one directory trades the download for a generator
+      # mismatch.  The cache above holds both.
       - name: Install the wheel and import it elsewhere
         shell: bash
+        env:
+          CMAKE_ARGS: -DEINSUM_DEPS_DIR=C:/dw
         run: |
           uv venv --python 3.12 "$RUNNER_TEMP/wheel"
           VIRTUAL_ENV="$RUNNER_TEMP/wheel" uv pip install . pytest
