@@ -95,7 +95,9 @@ set_tests_properties(python.pytest PROPERTIES ENVIRONMENT "${EINSUM_PYTEST_ENV}"
 # build turns EINSUM_BUILD_PYTHON on as well and none of this is its business.
 # The thread pools have to be pinned in the environment: OpenBLAS sizes its
 # pool when it loads, so benchmarks/conftest.py can only check, not fix.
-if (NOT SKBUILD)
+# benchmarks/ is untracked, like benchmark/ at the top level, so the target
+# exists only in a tree that still has one.  A clone gets neither.
+if (NOT SKBUILD AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks")
     add_custom_target(python_benchmark_json
             COMMAND ${CMAKE_COMMAND} -E env ${EINSUM_PYTEST_ENV}
             "OMP_NUM_THREADS=1" "OPENBLAS_NUM_THREADS=1" "MKL_NUM_THREADS=1"

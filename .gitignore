@@ -589,6 +589,15 @@ _skbuild/
 /python/einsum/*.so
 /python/einsum/*.pyd
 
+# The benchmarks are a local working directory, not part of what this repository
+# publishes: the numbers are one machine's and go stale, and the suites pull in
+# Google Benchmark, pytest-benchmark, opt-einsum and optionally torch to produce
+# something that is neither a pass nor a fail.  Kept on disk, out of the tree.
+# EINSUM_BUILD_BENCHMARKS defaults OFF for the same reason -- a clone has no
+# benchmark/ for it to add_subdirectory.
+/benchmark/
+/python/benchmarks/
+
 # Prose: README.md is the only Markdown this repo carries.  Scratch notes, design
 # write-ups and generated reports all land as .md in the tree, and none of them
 # is worth a commit -- so the default is ignored and the one file is the

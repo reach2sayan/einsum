@@ -89,7 +89,6 @@ machine's idea of "Boost" can change what this builds against.
 | Boost | 1.92.0 (`b2-nodocs` tarball) | Parser, Mp11, Preprocessor, Container, Test |
 | Eigen | 3.4.0 | every kernel |
 | kokkos mdspan | commit `80fc772e` | `<experimental/mdspan>`; no libstdc++ on the floor ships `<mdspan>` |
-| Google Benchmark | 1.9.1 | benchmarks only |
 
 Sources are unpacked into `<repo>/.deps`, outside every build tree, so
 `rm -rf build` does not re-download them.
@@ -127,8 +126,8 @@ cmake --preset release -DEINSUM_TRACE=ON       # -ftime-trace / -ftime-report
 cmake --preset asan -DEINSUM_SANITIZE=thread   # or undefined
 ```
 
-Options: `EINSUM_BUILD_TESTS`, `EINSUM_BUILD_BENCHMARKS`, `EINSUM_BUILD_PYTHON`,
-`EINSUM_INSTALL`, `EINSUM_NATIVE_ARCH`, `EINSUM_OPENMP`, `EINSUM_SANITIZE`
+Options: `EINSUM_BUILD_TESTS`, `EINSUM_BUILD_PYTHON`, `EINSUM_INSTALL`,
+`EINSUM_NATIVE_ARCH`, `EINSUM_OPENMP`, `EINSUM_SANITIZE`
 (`off`/`address`/`undefined`/`thread`), `EINSUM_TRACE`.
 
 `EINSUM_OPENMP` (off by default; on in the `python` preset and the Linux
@@ -463,149 +462,6 @@ x64 only, and the binaries require AVX2. The `.targets` also restates the
 compile options a consumer needs -- the constexpr budget above all, since the
 compile-time planner runs in *your* translation units -- so keep it in step with
 the `einsum` INTERFACE target in `CMakeLists.txt` if you change either.
-
-## Benchmarks
-
-```
-cmake --build --preset release --target einsum_benchmark
-./build/release/benchmark/einsum_benchmark --benchmark_filter='_double_(8|64)$'
-```
-
-`--target benchmark_json` leaves a machine-readable run beside the binary. A
-sample (`-O3 -march=native`, GCC 15, one core):
-
-```
-BM_naive_double_64                 37598 ns
-BM_naive_opt_double_64             37544 ns
-BM_einsum_ct_double_64             11332 ns
-BM_einsum_rt_double_64             11195 ns
-BM_eigen_fixed_double_64           10995 ns
-BM_eigen_dyn_double_64             14126 ns
-```
-
-The lowerings that are not a product are measured beside the Eigen call a
-reader would have written instead, so a regression in one shows up as a ratio
-rather than as a number nobody has anything to compare against:
-
-```
-BM_einsum_reduce_double/512        24815 ns
-BM_rowsum_eigen_double/512         24725 ns
-BM_einsum_transpose_double_64       2465 ns
-BM_transpose_eigen_double_64        1410 ns
-```
-
-### Against NumPy
-
-The same question at the Python level: is `einsum.contract` worth importing
-when `np.einsum` is already there?
-
-```
-uv sync --group bench
-cmake --build --preset python --target python_benchmark_json
-```
-
-`python/benchmarks/` runs each contraction against `np.einsum` (three ways:
-plain, `optimize=True`, and handed a path `np.einsum_path` already found),
-`opt_einsum`, `torch.einsum`, and the plain NumPy call a caller would have
-written by hand -- the floor. Every plan is warm before the clock starts and
-every answer is checked against `np.einsum` before it is timed. One core:
-`OMP_NUM_THREADS=1`, which the target sets, because this einsum has no thread
-pool and a BLAS that fans out is measuring the machine.
-
-torch is opt-in (`uv pip install torch --torch-backend=cpu`); without it that
-row skips. `pytest-benchmark compare` reads two of the saved JSON runs.
-
-The target also pins `MALLOC_MMAP_THRESHOLD_` and `MALLOC_TRIM_THRESHOLD_`.
-That is not tuning, it is repeatability: see the note below.
-
-Minimum over the run, in microseconds, on one core of this machine
-(`-march=native`, GCC 14, float64 unless the name says otherwise):
-
-```
-case            einsum   np.einsum   np(path)   opt_einsum    torch   by hand
-matmul_8          0.89        2.32       9.41         8.45     9.00      0.99
-matmul_16         1.26        3.65      10.09         9.57    10.14      1.22
-matmul_64        11.76       64.94      20.02        20.03    23.73     10.69
-matmul_256      541.88     3133.11     557.58       570.65   656.04    548.27
-matmul_64_f32     6.34       47.16      17.21        15.53    15.99      5.91
-batched_8x16      3.75       23.37      13.92        23.63    14.41      3.35
-chain3            5.65     1975.78      21.26        22.46   113.20     21.29
-chain3_bad       10.21     4479.48      25.64        25.86   108.81     37.75
-chain4            2.75    21572.02      22.24        22.45   142.18      6.70
-tensordot        11.64       62.77      24.08        22.63    29.06     15.19
-reduce_rows      22.25       27.11      32.83        31.10    32.01     46.51
-trace             0.95        1.89       6.76         4.73     6.08      1.48
-diagonal          1.01        0.98       5.36         3.43     4.27      1.34
-outer            31.00       74.96     123.01        79.77    36.75    125.86
-matvec           28.81       82.20      33.90        30.47    42.31     21.91
-transpose_64      2.00        0.86       5.91         3.44     3.48      1.76
-```
-
-Where a contraction is a chain, the path is worth more than the kernel and this
-is 3x ahead of everything else -- `chain4` against plain `np.einsum` is four
-orders of magnitude, which is the whole argument for choosing a path at all,
-and torch, which does not choose one, is 50x behind on the same row. Where it
-is one GEMM it is level with NumPy calling BLAS, at 8 and at 256 alike; where
-it is a rank-one product (`outer`) it is at the cost of writing the result,
-which is where torch is too and 4x from where NumPy is.
-
-Two rows read as losses and are not. `np.einsum` answers `"ij->ji"` and
-`"ii->i"` with a *view* of its input -- `np.shares_memory` says so -- and does
-no work at all; this returns an array. Against the copy a caller would have to
-make anyway (`x.T.copy()`, the "by hand" column) the two are level, and the
-per-call floor here is under NumPy's own: 0.8us against 1.0 for `"i->i"` on
-four elements.
-
-### With threads
-
-The table above is one core by construction. Unpinned, NumPy's BLAS and torch
-use every core they can see, and until `EINSUM_OPENMP` this library used one:
-at 256 and up that was a 5x deficit no kernel could make back. With it, the
-same product on a team (`OMP_NUM_THREADS`, or `einsum.set_num_threads`),
-minimum in microseconds, each library given the same count:
-
-```
-                          1 thread             8 threads            16 threads
-                  einsum  numpy  torch   einsum  numpy  torch   einsum  numpy  torch
-matmul 256           561    568    671      109    215    234      123    127    145
-matmul 512          4658   4653   5338     1032   1030   1795      942    994   1225
-matmul 1024        41779  38236  44054     7456   7439  14705     8986   9129  11449
-chain3 256,64,1024   790    839      -      226    371      -      532    244      -
-```
-
-Level with OpenBLAS and ahead of torch at every size and count. The one thing
-to know: this is an 8-core part with 16 hardware threads, and the 16-thread
-column is the hyperthreads showing -- a chain of small products spends more
-on the team than the team saves, and `chain3` at 16 is 2x worse than at 8.
-The default is whatever `OMP_NUM_THREADS` says, and on such a machine the
-physical core count is the number to say.
-
-### A note on the allocator
-
-`matmul_256` is the row that taught this suite to pin `MALLOC_*`. Its result is
-512KB; glibc serves a block that size by mmap and returns it to the kernel on
-free, so a call that allocates its result faults in 128 fresh zeroed pages and
-then immediately overwrites them. `perf` puts it at 116 extra faults and ~455us
-per call -- more than the arithmetic. It is a real cost, but not one every
-process pays, and the thing that decides it is not this library:
-
-```
-                                   einsum   numpy a @ b
-plain interpreter                  1380 us        794 us
-after `import torch`                547 us        554 us
-MALLOC_* thresholds raised          561 us        590 us
-```
-
-Importing torch retunes glibc, and moves this row by 2.5x without touching a
-line of einsum. Unpinned, whether torch happens to be installed would decide
-what every other row measured. Pinned, the kernel is level with OpenBLAS and
-the allocator is out of the comparison. Writing into an output you already own
--- `einsum::out(x)` in C++ -- avoids the whole question: 654us against 724us
-for the same product through a bare Eigen `noalias()`.
-
-`transpose_64` is the remaining loss and is printed rather than dropped. It is
-a copy, not a contraction, and at 2us against NumPy's 0.9 what separates them
-is per-call work, not the kernel.
 
 ## Tracing and sanitizers
 
