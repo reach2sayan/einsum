@@ -25,7 +25,17 @@ jobs:
       # interpreters, the manylinux image and its gcc-toolset-15, and the
       # per-wheel `pytest {package}/python/tests` that has to pass before a
       # wheel is kept.  Nothing about the build lives here.
-      - uses: pypa/cibuildwheel@v3.1.1
+      #
+      # The version is not a formality.  Each release pins the manylinux image
+      # it runs in, and the one v3.1.1 pins (2025.07.23-1) carries patchelf
+      # 0.17.2, which lays out a rewritten ELF wrong: `.dynstr` ends up outside
+      # any LOAD segment and .init/.plt are moved into a segment appended after
+      # it.  auditwheel reaches for patchelf whenever it grafts a library, so
+      # the Linux wheel started segfaulting inside dlopen -- before a line of
+      # Python ran -- the moment EINSUM_OPENMP=ON gave it a libgomp to carry.
+      # v4.2.1's image has patchelf 0.19.1, where the same repair is sound.
+      # Read a bump as a floor and not a preference.
+      - uses: pypa/cibuildwheel@v4.2.1
 
       - uses: actions/upload-artifact@v4
         with:
