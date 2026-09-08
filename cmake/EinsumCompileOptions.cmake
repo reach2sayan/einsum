@@ -22,8 +22,25 @@ endif ()
 
 # --- flags -------------------------------------------------------------------
 if (MSVC)
-    set(EINSUM_CODEGEN_FLAGS /arch:AVX2 /bigobj /EHs-c- /D_HAS_EXCEPTIONS=0 /wd4577)
+    # /Zc:preprocessor: util/error.hpp builds the errc table with
+    # Boost.Preprocessor, which the traditional preprocessor only reaches
+    # through its own workaround headers.  /constexpr:* because the whole
+    # planner runs at compile time and MSVC's evaluator has the lowest default
+    # budget of the three.  /external:anglebrackets is safe here because our own
+    # headers are quoted without exception -- only Boost, Eigen, mdspan and the
+    # standard library arrive in angle brackets.
+    set(EINSUM_CODEGEN_FLAGS
+            /arch:AVX2 /bigobj
+            /Zc:preprocessor /Zc:__cplusplus /utf-8
+            /constexpr:steps10000000 /constexpr:depth2048
+            /EHs-c- /D_HAS_EXCEPTIONS=0 /wd4577)
     set(EINSUM_WARNINGS /W4 /external:anglebrackets /external:W0)
+    # einsum_rt is SHARED and every symbol it exports is hidden by default on
+    # this platform too -- but here EINSUM_API covers only rt/parse.hpp's two
+    # functions, and Boost's inline code in a consumer expects to find the
+    # boost::throw_exception replacements as well.  Rather than decorate those
+    # by hand in namespace boost, let the linker export what the objects define.
+    set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 else ()
     set(EINSUM_CODEGEN_FLAGS "")
     if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
@@ -64,8 +81,27 @@ function(einsum_target_flags target)
         list(REMOVE_ITEM flags -fno-exceptions /EHs-c- /D_HAS_EXCEPTIONS=0)
     endif ()
     target_compile_options(${target} PRIVATE ${flags} ${EINSUM_WARNINGS})
+    # Not on MSVC: it reports command-line warnings no source change can
+    # silence -- D9025 for the /EHsc the generator adds and this function then
+    # overrides with /EHs-c- -- and a build cannot fail on those.
     if (NOT MSVC)
         set_property(TARGET ${target} PROPERTY COMPILE_WARNING_AS_ERROR ON)
+    endif ()
+endfunction()
+
+# einsum_runtime_deps(<target>)
+# Everything that links einsum::rt has to find libeinsum_rt at run time.  On
+# ELF that is one RPATH entry; on Windows there is no such thing, and the
+# loader looks beside the binary -- so the DLLs the target links get copied
+# there after it is built.  $<TARGET_RUNTIME_DLLS> is empty on every other
+# platform, and the whole command is skipped there anyway.
+function(einsum_runtime_deps target)
+    set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "$ORIGIN")
+    if (WIN32)
+        add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:${target}> $<TARGET_FILE_DIR:${target}>
+                COMMAND_EXPAND_LISTS)
     endif ()
 endfunction()
 

@@ -1,0 +1,39 @@
+# Puts cl.exe and the SDK on PATH, via GITHUB_ENV so later steps inherit it.
+# That is all the presets' Ninja generator needs -- no compiler is pinned in a
+# preset, so cl is simply what it finds once this has run.
+#
+# Written out rather than ilammy/msvc-dev-cmd@v1: that action still declares
+# node20 at its latest release and is the one thing that would print a
+# deprecation notice on every Windows run.  What it does is the script below.
+name: Set up MSVC (x64)
+description: Export the x64 MSVC developer environment into GITHUB_ENV.
+
+runs:
+  using: composite
+  steps:
+    - shell: pwsh
+      run: |
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        $root = & $vswhere -latest -products '*' `
+          -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+          -property installationPath
+        if (-not $root) { throw "no Visual Studio with the C++ toolset found" }
+        $vcvars = Join-Path $root 'VC\Auxiliary\Build\vcvars64.bat'
+        # `set` in a fresh cmd, after vcvars: the whole environment the toolset
+        # wants.  Only what vcvars actually changed is forwarded, and the banner
+        # lines it prints have no name=value shape, so the match drops them
+        # along with cmd's `=C:`-style pseudo-variables.
+        $env_after = & "$env:COMSPEC" /s /c "`"$vcvars`" && set"
+        if ($LASTEXITCODE -ne 0) { throw "vcvars64.bat failed ($LASTEXITCODE)" }
+        foreach ($line in $env_after) {
+          if ($line -notmatch '^([^=\s]+)=(.*)$') { continue }
+          $name, $value = $Matches[1], $Matches[2]
+          if ([Environment]::GetEnvironmentVariable($name) -eq $value) { continue }
+          [Environment]::SetEnvironmentVariable($name, $value)
+          "$name=$value" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+        }
+        # Fails here, with a name, rather than at configure time with a CMake
+        # message about no working compiler.
+        $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+        if (-not $cl) { throw "cl.exe is not on PATH after vcvars64.bat" }
+        Write-Host "cl.exe: $($cl.Source)"

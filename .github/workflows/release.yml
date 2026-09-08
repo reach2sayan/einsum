@@ -22,21 +22,10 @@ jobs:
           test "$written" = "$tagged" || {
             echo "CMakeLists.txt says $written, the tag says $tagged"; exit 1; }
 
+  # Shared with Trial release, so what a tag builds is what a dry run built.
   wheels:
     needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - uses: pypa/cibuildwheel@v3.1.1
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wheels-${{ matrix.os }}
-          path: wheelhouse/*.whl
+    uses: ./.github/workflows/wheels.yml
 
   release:
     needs: wheels

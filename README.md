@@ -27,7 +27,7 @@ Every failure travels through `std::expected`; nothing in any header throws.
 
 | | |
 |---|---|
-| Compiler | GCC 14+ or Clang 20+ |
+| Compiler | GCC 14+ or Clang 20+; MSVC 2022 (17.10+) is built but not promised |
 | Standard | C++23 |
 | CMake | 3.26+ |
 
@@ -41,7 +41,32 @@ than letting the build fail a thousand lines in.
 
 The top-level `CMakeLists.txt` picks `g++-15` or `g++-14` off `PATH` before
 `project()` unless you set `CMAKE_CXX_COMPILER` or `CXX`, because the default
-`g++` on many distributions is still 13.
+`g++` on many distributions is still 13. Not on Windows, where the compiler is
+whatever the developer prompt put there.
+
+### Windows
+
+MSVC builds in CI and is not gated on: the two Windows jobs carry
+`continue-on-error`, so a red Windows leg does not fail a pull request. The
+build is watched, in other words, rather than promised. There is no Windows
+preset -- the presets pin no compiler, so `cmake --preset release` from a
+developer command prompt is the whole of it, and CI names `cl` on the command
+line rather than in a preset.
+
+Two things differ from the Linux build by design rather than by omission:
+
+- **The vendored header list is not checked.** `scripts/vendor_headers.py` asks
+  the compiler for the include closure with `-M`, which `cl.exe` has no
+  spelling for, so `EINSUM_CHECK_VENDORED_HEADERS` defaults off on Windows and
+  Linux stays the authority for `cmake/EinsumVendoredHeaders.cmake` -- as it is
+  for `python/einsum/_einsum.pyi`. The list already ships the MSVC arms of
+  `boost/config` and `boost/preprocessor`, which are vendored whole, so an
+  installed einsum is consumable from MSVC regardless of which compiler derived
+  it.
+- **`tests_noalloc` does not run.** Replacing `operator new` is program-wide on
+  ELF; a DLL keeps the CRT's. The suite is a statement about the library's
+  allocation behaviour rather than about the platform, and Linux is where it can
+  still be made.
 
 ## Dependencies
 

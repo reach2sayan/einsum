@@ -1,0 +1,52 @@
+# A release with the publishing taken out: the same wheel matrix Release runs,
+# on demand, leaving the wheels as run artifacts and nothing else.  No tag, no
+# GitHub Release, no version number spent.
+#
+# What it is for.  The wheels are the one artifact CI does not otherwise build
+# -- the CMake workflow builds the library and the extension in the build tree,
+# never a wheel -- and the Windows wheel in particular has a longer way to fall
+# than the Linux one: cibuildwheel drives scikit-build-core, which configures
+# this repository's CMakeLists with MSVC and no preset, so it is the only path
+# that reaches the compiler without the windows-* presets to set things up.
+# Finding that out during a tag means finding it out with the version already
+# committed and the tag already pushed.
+#
+# Run it before tagging anything by hand, and after any change to pyproject.toml,
+# to cmake/, or to the pins.
+name: Trial release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    uses: ./.github/workflows/wheels.yml
+
+  # The wheels are already artifacts of the job above; this only says so in the
+  # run summary, where someone who dispatched the workflow will look first.
+  summary:
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: What was built
+        run: |
+          {
+            echo "### Trial release -- nothing was published"
+            echo
+            echo "| wheel | size |"
+            echo "|---|---|"
+            for w in dist/*.whl; do
+              printf '| `%s` | %s |\n' "$(basename "$w")" "$(du -h "$w" | cut -f1)"
+            done
+            echo
+            echo "Download them from this run's artifacts."
+          } >> "$GITHUB_STEP_SUMMARY"

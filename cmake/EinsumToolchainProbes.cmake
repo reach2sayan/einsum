@@ -18,7 +18,11 @@ include_guard(GLOBAL)
 
 include(CheckCXXSourceCompiles)
 
-set(CMAKE_REQUIRED_FLAGS "-std=c++23")
+# No CMAKE_REQUIRED_FLAGS: try_compile() carries CMAKE_CXX_STANDARD into the
+# probe, and the root CMakeLists sets it to 23 before including this file.  It
+# used to say -std=c++23 by hand, which asks cl.exe for an option it does not
+# have -- the probe then measured the default standard, and would have passed
+# or failed for a reason unrelated to the floor.
 check_cxx_source_compiles(
         "#include <expected>
          #include <ranges>
@@ -37,17 +41,16 @@ check_cxx_source_compiles(
            return std::expected<int, int>{s.total}.value() - 3;
          }"
         EINSUM_TOOLCHAIN_OK)
-unset(CMAKE_REQUIRED_FLAGS)
 
-if (NOT MSVC AND NOT EINSUM_TOOLCHAIN_OK)
+if (NOT EINSUM_TOOLCHAIN_OK)
     message(FATAL_ERROR
             "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} cannot build "
             "EinsteinSummation, which needs <expected>, std::views::enumerate and "
-            "std::from_range.  Build with GCC 14+, or Clang 20+ against libstdc++ 14+ "
-            "-- with clang it is the standard library that decides, not the compiler, "
-            "so a new clang paired with an old libstdc++ lands here.  Clang 18 is out "
-            "on <expected> regardless: libstdc++ gates it on __cpp_concepts, which "
-            "that release does not define high enough, so the header is there and "
-            "declares nothing.  The compiler's own diagnostic is in the "
-            "CMakeConfigureLog.")
+            "std::from_range.  Build with GCC 14+, MSVC 19.38+ (Visual Studio 2022 "
+            "17.8), or Clang 20+ against libstdc++ 14+ -- with clang it is the "
+            "standard library that decides, not the compiler, so a new clang paired "
+            "with an old libstdc++ lands here.  Clang 18 is out on <expected> "
+            "regardless: libstdc++ gates it on __cpp_concepts, which that release "
+            "does not define high enough, so the header is there and declares "
+            "nothing.  The compiler's own diagnostic is in the CMakeConfigureLog.")
 endif ()

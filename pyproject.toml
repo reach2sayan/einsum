@@ -54,6 +54,11 @@ EINSUM_INSTALL = "OFF"
 # (x86-64-v3) rather than the runner's CPU.  Without this the default is
 # -march=native and the wheel is unloadable anywhere else.
 EINSUM_NATIVE_ARCH = "OFF"
+# The check asks a compiler for the include closure with `-M`, which is a
+# GCC/Clang spelling -- so it cannot run in the MSVC wheel build at all.  It has
+# nothing to say about a wheel on any platform either: EINSUM_INSTALL is OFF
+# above, so no header is installed for the list to be stale against.
+EINSUM_CHECK_VENDORED_HEADERS = "OFF"
 
 # --- release wheels -----------------------------------------------------------
 # One wheel per CPython: pybind11 has no stable-ABI mode, and native_enum and
