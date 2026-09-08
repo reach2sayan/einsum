@@ -42,7 +42,8 @@
           { "context": "g++-14" },
           { "context": "clang++-20" },
           { "context": "install and consume" },
-          { "context": "python bindings" }
+          { "context": "python bindings" },
+          { "context": "MSVC 2022 (release)" }
         ]
       }
     },

@@ -13,6 +13,13 @@
 #
 # Run it before tagging anything by hand, and after any change to pyproject.toml,
 # to cmake/, or to the pins.
+#
+# This covers the wheels only.  Release itself now takes workflow_dispatch, and
+# a dispatch of it is the fuller rehearsal -- wheels, the NuGet package with its
+# size gate and MSBuild consumer check, and the trusted-publishing exchange,
+# with both publishing steps skipped because the ref is not a tag.  Reach for
+# that one when the nuget leg or the release plumbing is what changed; the
+# nuget job is deliberately not duplicated here.
 name: Trial release
 
 on:

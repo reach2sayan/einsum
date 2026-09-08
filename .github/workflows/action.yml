@@ -71,16 +71,25 @@ jobs:
         run: ctest --preset release
 
   # --- Windows ----------------------------------------------------------------
-  # Two jobs, both advisory for now.  continue-on-error is deliberate and
-  # temporary: nothing here had ever been compiled by cl.exe -- cmake/ carried
-  # MSVC branches nobody had run -- and the cheapest way to find out what MSVC
-  # thinks is to let it say so on every push without blocking anyone.
+  # The advisory period is over for the job below.  It ran continue-on-error
+  # while nothing here had ever been compiled by cl.exe, on the argument that
+  # the cheapest way to find out what MSVC thinks is to let it say so on every
+  # push without blocking anyone -- but that flag masks a job's conclusion to
+  # success whether its steps passed or failed, so for as long as it was set,
+  # nothing in this repository could tell a working MSVC build from a broken
+  # one.  `gh run list` reported this workflow green on every commit while
+  # cl.exe was in fact failing to compile main.cpp and tests_rt.cpp.
   #
-  # Ending that period has to be deliberate, because continue-on-error masks a
-  # job's conclusion to success whether its steps passed or failed: in the run
-  # list a working MSVC job and a broken one look the same, and only the
-  # step-level conclusions tell them apart.  CONTRIBUTING.md says what flipping
-  # it involves.
+  # What ended it is the NuGet package: contrib/nuget ships einsum_rt built by
+  # this toolchain, and a package on nuget.org is the strongest claim about
+  # MSVC the project can make.  Backing it with the weakest signal available was
+  # the contradiction.  `MSVC 2022 (release)` is now a required check in
+  # .github/rulesets/main.json, and Weekly release's green gate means what it
+  # says as a result.
+  #
+  # `python bindings (Windows)` below stays advisory: it is a different
+  # question -- extension loading and interpreter plumbing -- and nothing in the
+  # NuGet package or the release depends on it.
   #
   # The same `release` and `python` presets the Linux jobs use, with the
   # compiler overridden on the command line -- the presets pin no compiler, so
@@ -90,7 +99,6 @@ jobs:
   build-windows:
     name: MSVC 2022 (release)
     runs-on: windows-2022
-    continue-on-error: true
     # The default is 360.  What wants bounding here is a runaway constant
     # evaluation: the whole planner runs at compile time, on an evaluator
     # slower and hungrier than GCC's.

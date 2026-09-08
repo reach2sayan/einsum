@@ -4,20 +4,44 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # The same thing without publishing anything: every job below runs, and the
+  # two that publish are gated on `github.ref_type == 'tag'`, so a dispatch on a
+  # branch is a full rehearsal that spends no version number.  Run one after any
+  # change to the nuget leg, to pyproject.toml, to cmake/ or to the pins --
+  # finding out during a tag means finding out with the tag already public.
+  workflow_dispatch:
 
+# Narrow by default.  The publishing job widens it for itself: `id-token: write`
+# is what NuGet/login exchanges for a short-lived key, and granting it at the
+# top would hand it to the wheel builds as well.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # Before an hour of wheel builds: the tag and the version CMake writes have to
-  # be the same number.
+  # be the same number.  It is also where that number is read out once, for the
+  # nuget job's -Version and the consumer check below.
   version:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: The tag and project(einsum VERSION ...) must agree
+      - name: Read project(einsum VERSION ...)
+        id: read
         run: |
           written=$(sed -n 's/^project(einsum VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          test -n "$written" || {
+            echo "::error::no project(einsum VERSION ...) in CMakeLists.txt"; exit 1; }
+          echo "version=$written" >> "$GITHUB_OUTPUT"
+          echo "einsum $written"
+
+      # Only a tag makes a claim about the number; a dispatch has no tag to
+      # disagree with.
+      - name: The tag and project(einsum VERSION ...) must agree
+        if: github.ref_type == 'tag'
+        run: |
+          written='${{ steps.read.outputs.version }}'
           tagged="${GITHUB_REF_NAME#v}"
           test "$written" = "$tagged" || {
             echo "CMakeLists.txt says $written, the tag says $tagged"; exit 1; }
@@ -27,16 +51,195 @@ jobs:
     needs: version
     uses: ./.github/workflows/wheels.yml
 
-  release:
-    needs: wheels
-    runs-on: ubuntu-latest
+  # The native package: headers plus einsum_rt in both CRT flavours, for a
+  # consumer who reaches this project through MSBuild rather than CMake.
+  # `needs: version` and not `needs: wheels`, so it runs alongside the wheel
+  # matrix rather than after it.
+  nuget:
+    needs: version
+    runs-on: windows-2022
+    # Two translation units per configuration, and the compile-time planner is
+    # not instantiated in the library build at all -- so this is minutes.  The
+    # bound is here for a runaway constant evaluation, not for the compile.
+    timeout-minutes: 120
 
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up MSVC (x64)
+        uses: ./.github/actions/msvc-x64
+
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          variant: sccache
+          key: msvc-nuget
+          max-size: 500M
+
+      # C:/dn, not the C:/d the CMake workflow uses, and its own cache key.
+      # EINSUM_DEPS_DIR is a FetchContent base directory, and a populated one
+      # remembers the generator that filled it: pointing Ninja Multi-Config at a
+      # directory Ninja wrote fails the configure outright with "Does not match
+      # the generator used previously".  Sharing the cache would trade one Boost
+      # unpack for a job that cannot start.
+      - name: Cache the pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: C:/dn
+          key: deps-msvc-nuget-${{ hashFiles('cmake/EinsumDependencies.cmake') }}
+          restore-keys: deps-msvc-nuget-
+
+      # No CMAKE_MSVC_DEBUG_INFORMATION_FORMAT here, unlike the CMake workflow:
+      # the preset empties it, which is both what keeps the package small and
+      # what lets sccache cache at all -- it cannot cache a separate PDB.
+      - name: Configure
+        run: >
+          cmake --preset nuget
+          -DCMAKE_C_COMPILER=cl
+          -DCMAKE_CXX_COMPILER=cl
+          -DEINSUM_DEPS_DIR=C:/dn
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Build both configurations
+        run: |
+          cmake --build --preset nuget --config Release
+          cmake --build --preset nuget --config Debug
+
+      - name: Install both configurations
+        run: |
+          cmake --install build/nuget --config Release --prefix prefix-release
+          cmake --install build/nuget --config Debug --prefix prefix-debug
+
+      - name: Pack
+        run: |
+          python scripts/pack_nuget.py --release prefix-release --debug prefix-debug --stage stage
+          nuget pack contrib/nuget/einsum.nuspec -Version ${{ needs.version.outputs.version }} -BasePath stage -OutputDirectory nupkg -NonInteractive -NoDefaultExcludes -Verbosity detailed
+
+      # nuget.org refuses anything over 250MB, and it refuses it at push time --
+      # after the wheels have built and the tag is public.  Said here instead.
+      - name: Under the nuget.org size limit
+        shell: bash
+        run: |
+          pkg=$(ls nupkg/*.nupkg)
+          bytes=$(stat -c %s "$pkg")
+          echo "$pkg: $(( bytes / 1000000 )) MB"
+          [[ $bytes -lt 250000000 ]] || {
+            echo "::error::$pkg is $(( bytes / 1000000 ))MB; nuget.org's limit is 250MB"
+            exit 1; }
+
+      # The only thing that checks einsum.targets.  cmake/EinsumCompileOptions
+      # attaches its flags PRIVATE, so the constexpr budget and /Zc:preprocessor
+      # a consumer needs exist in exactly two hand-written places -- that file
+      # and the einsum INTERFACE target -- and neither is exercised by anything
+      # else on this platform.  The program is the one .github/workflows/action.yml
+      # builds against a CMake prefix, so both paths make the same claim: it
+      # reaches the DLL through einsum("ij,jk->ik") and the compile-time planner
+      # through the _ct literal, and returns non-zero if either is wrong.
+      - name: A consumer can build against it
+        shell: pwsh
+        run: |
+          $v = "${{ needs.version.outputs.version }}"
+          New-Item -ItemType Directory consumer | Out-Null
+          Set-Location consumer
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <packages>
+            <package id="einsum" version="$v" targetFramework="native" />
+          </packages>
+          "@ | Set-Content packages.config
+          @'
+          #include <einsum/einsum.hpp>
+          #include <einsum/rt/parse.hpp>
+          #include <Eigen/Core>
+
+          int main() {
+            using einsum::literals::operator""_ct;
+            const Eigen::MatrixXd a = Eigen::MatrixXd::Ones(3, 4);
+            const Eigen::MatrixXd b = Eigen::MatrixXd::Ones(4, 2);
+            const auto rt = einsum::einsum("ij,jk->ik");
+            const auto ct = einsum::einsum("ij,jk->ik"_ct);
+            return (*(*rt)(a, b))(0, 0) == 4.0 && (*ct(a, b))(0, 0) == 4.0 ? 0 : 1;
+          }
+          '@ | Set-Content main.cpp
+          @"
+          <?xml version="1.0" encoding="utf-8"?>
+          <Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+            <ItemGroup Label="ProjectConfigurations">
+              <ProjectConfiguration Include="Release|x64">
+                <Configuration>Release</Configuration>
+                <Platform>x64</Platform>
+              </ProjectConfiguration>
+            </ItemGroup>
+            <PropertyGroup Label="Globals">
+              <ProjectGuid>{2C7A1E4B-7C6E-4A2B-9A1D-6E5F0C3D8B41}</ProjectGuid>
+              <RootNamespace>consumer</RootNamespace>
+              <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+            </PropertyGroup>
+            <Import Project="`$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+            <PropertyGroup Label="Configuration">
+              <ConfigurationType>Application</ConfigurationType>
+              <PlatformToolset>v143</PlatformToolset>
+            </PropertyGroup>
+            <Import Project="`$(VCTargetsPath)\Microsoft.Cpp.props" />
+            <ItemGroup>
+              <ClCompile Include="main.cpp" />
+            </ItemGroup>
+            <Import Project="`$(VCTargetsPath)\Microsoft.Cpp.targets" />
+            <Import Project="packages\einsum.$v\build\native\einsum.targets" />
+          </Project>
+          "@ | Set-Content consumer.vcxproj
+
+          nuget install packages.config -OutputDirectory packages -Source "$env:GITHUB_WORKSPACE\nupkg" -NonInteractive
+          if ($LASTEXITCODE -ne 0) { throw "nuget install failed" }
+          msbuild consumer.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+          if ($LASTEXITCODE -ne 0) { throw "the consumer did not build" }
+          # EinsumCopyDll should have put einsum_rt.dll beside the exe; if it did
+          # not, this is where the loader says so.
+          & .\x64\Release\consumer.exe
+          if ($LASTEXITCODE -ne 0) { throw "the consumer built but returned $LASTEXITCODE" }
+          Write-Host "the package builds and runs"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nuget
+          path: nupkg/*.nupkg
+
+  # Trusted publishing is the one part a dispatch cannot otherwise rehearse: the
+  # OIDC exchange either works or the first tag finds out.  This mints a key and
+  # deliberately does not spend it.  Seconds.
+  nuget-login-check:
+    if: github.event_name == 'workflow_dispatch' && vars.NUGET_USER != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ vars.NUGET_USER }}
+      - run: |
+          test -n "${{ steps.login.outputs.NUGET_API_KEY }}" || {
+            echo "::error::NuGet/login returned no key"; exit 1; }
+          echo "the trusted-publishing exchange works"
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [ version, wheels, nuget ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # For NuGet/login below.  nuget.org's policy is keyed on the repository and
+      # this workflow's filename, so renaming this file breaks publishing.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No pattern: the wheels and the .nupkg both belong on the release, and a
+      # `wheels-*` filter would silently drop the package.
       - uses: actions/download-artifact@v4
         with:
-          pattern: wheels-*
           path: dist
           merge-multiple: true
 
@@ -47,4 +250,22 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            dist/*.whl
+            dist/*
+
+      # Both steps skip when NUGET_USER is unset, which is what makes this
+      # workflow inert on a fork and on an account that has not set trusted
+      # publishing up.  It is a repository *variable*, not a secret: there is no
+      # API key anywhere here, only the short-lived one minted below.
+      - name: NuGet login
+        if: vars.NUGET_USER != ''
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Publish to nuget.org
+        if: vars.NUGET_USER != ''
+        run: |
+          dotnet nuget push dist/*.nupkg \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json

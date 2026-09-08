@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>einsum</id>
+    <version>$version$</version>
+    <authors>Sayan Samanta</authors>
+    <license type="expression">BSL-1.0</license>
+    <projectUrl>https://github.com/reach2sayan/einsum</projectUrl>
+    <repository type="git" url="https://github.com/reach2sayan/einsum.git" />
+    <readme>README.md</readme>
+    <description>Einstein summation for C++23: one immutable object, one call
+operator, the result back by value in the operands' own type, every failure
+through std::expected and nothing in any header that throws. The subscript can
+reach a template parameter -- where a bad one is a static_assert carrying the
+sentence rather than a template backtrace, and the contraction path is chosen
+during constant evaluation -- or be parsed at run time. Native x64 package: the
+public headers plus einsum_rt.dll and einsum_rt.lib in Release and Debug, with
+the Boost 1.92, Eigen 3.4 and kokkos/mdspan header subsets the public interface
+reaches bundled in, so a consumer needs no other package. Consumers compile with
+/std:c++latest and need MSVC 19.38 (Visual Studio 17.8) or newer for
+&lt;expected&gt;, std::views::enumerate and std::from_range. The binaries require
+AVX2. Only the run-time subscript parser is compiled; the rest of the library,
+the whole compile-time planner included, is headers.</description>
+    <tags>native einsum tensor tensor-contraction linear-algebra eigen numpy compile-time constexpr cpp cpp23</tags>
+  </metadata>
+  <files>
+    <file src="build\native\**" target="build\native" />
+    <file src="README.md" target="" />
+    <file src="LICENSE.txt" target="" />
+  </files>
+</package>

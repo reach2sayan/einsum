@@ -62,6 +62,18 @@ using Unit = Eigen::InnerStride<1>;
 // Hands `f` an Eigen inner stride whose *type* says whether it is one.  Two
 // instantiations of the body, and the branch is paid once rather than per
 // element.
+//
+// Every caller names that type with an explicit template parameter --
+// `[&]<typename S>(const S stride)` -- and spells the maps `VecMap<T, S>`.
+// Recovering it instead with `decltype` on the parameter is what the callers
+// used to do, and it does not survive the nested lambdas they all have: the
+// stride is captured by reference, and MSVC resolves `decltype` on a
+// by-reference capture to the closure's member type, `const Unit &`.  Eigen's
+// third Map argument is a stride *type*, so it then asks a reference for
+// `::InnerStrideAtCompileTime` and the error arrives inside Map.h with nothing
+// naming this file.  GCC and Clang say `const Unit`, which Eigen tolerates --
+// so the bug is invisible off MSVC.  Naming the parameter sidesteps the
+// question and drops the stray const.
 template <typename F>
 constexpr void with_inner_stride(const index_t stride, F &&f) noexcept {
   if (stride == 1) {
@@ -121,13 +133,13 @@ void shuffle(PackedPtr<D, T> packed, StridedPtr<D, T> strided,
         rows);
   };
   if (run.ok) {
-    with_inner_stride(run.stride, [&](const auto stride) noexcept {
+    with_inner_stride(run.stride, [&]<typename S>(const S stride) noexcept {
       lines([&](auto *line, auto *flat) noexcept {
         if constexpr (D == Direction::gather) {
           VecMap<T, Unit>{flat, cols_n} =
-              CVecMap<T, decltype(stride)>{line, cols_n, stride};
+              CVecMap<T, S>{line, cols_n, stride};
         } else {
-          VecMap<T, decltype(stride)>{line, cols_n, stride} =
+          VecMap<T, S>{line, cols_n, stride} =
               CVecMap<T, Unit>{flat, cols_n};
         }
       });
@@ -274,12 +286,13 @@ struct ReduceKernel {
     // row -- so both are settled out here, and the row loop is one sum with
     // nothing left to decide.
     if (pg.red_run.ok) {
-      with_inner_stride(pg.red_run.stride, [&](const auto stride) noexcept {
+      with_inner_stride(pg.red_run.stride, [&]<typename S>(
+                                              const S stride) noexcept {
         index_t i = 0;
         for_each_offset(
             [&](const index_t keep_offset) noexcept {
-              dst[i++] = CVecMap<T, decltype(stride)>{
-                  src + keep_offset, pg.red_run.extent, stride}
+              dst[i++] = CVecMap<T, S>{src + keep_offset, pg.red_run.extent,
+                                       stride}
                              .sum();
             },
             pg.keep);
@@ -324,12 +337,13 @@ struct PermuteKernel {
     };
     // Both steps are the same for every line, and a transpose is exactly the
     // case where one of the two is 1: settled here rather than per element.
-    with_inner_stride(dst_step, [&](const auto to_step) noexcept {
-      with_inner_stride(src_step, [&](const auto from_step) noexcept {
+    with_inner_stride(dst_step, [&]<typename To>(const To to_step) noexcept {
+      with_inner_stride(src_step, [&]<typename From>(
+                                      const From from_step) noexcept {
         for_each_offset(
             [&](const index_t to, const index_t from) noexcept {
-              VecMap<T, decltype(to_step)>{dst.data + to, inner, to_step} =
-                  CVecMap<T, decltype(from_step)>{src + from, inner, from_step};
+              VecMap<T, To>{dst.data + to, inner, to_step} =
+                  CVecMap<T, From>{src + from, inner, from_step};
             },
             but_last(dst.layout), but_last(src_layout));
       });

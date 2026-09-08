@@ -51,6 +51,19 @@
         "Python_ROOT_DIR": "${sourceDir}/.venv",
         "Python_FIND_VIRTUALENV": "ONLY"
       }
+    },
+    {
+      "name": "nuget",
+      "displayName": "Release + Debug, library only -- what the NuGet package ships",
+      "description": "Ninja Multi-Config, so one configure produces both CRT flavours: a consumer building /MDd needs an import library that matches. Windows and MSVC only. Debug carries no debug information on purpose -- CMAKE_MSVC_DEBUG_INFORMATION_FORMAT is emptied below, which is what keeps the package small and what lets sccache cache the output at all, since it cannot cache a separate PDB. Inherits base rather than release: this is a multi-config tree, where a CMAKE_BUILD_TYPE would be inert.",
+      "inherits": "base",
+      "generator": "Ninja Multi-Config",
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "Release;Debug",
+        "CMAKE_MSVC_DEBUG_INFORMATION_FORMAT": "",
+        "EINSUM_BUILD_TESTS": "OFF",
+        "EINSUM_BUILD_BENCHMARKS": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -69,6 +82,10 @@
     {
       "name": "python",
       "configurePreset": "python"
+    },
+    {
+      "name": "nuget",
+      "configurePreset": "nuget"
     }
   ],
   "testPresets": [

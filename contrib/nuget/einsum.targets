@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Imported into every vcxproj that references the einsum package.  NuGet does
+     that because this file's name matches the package id; there is no other
+     wiring.
+
+     The package carries x64 binaries in the two CRT flavours, and every
+     configuration that is not Debug links Release -- which is what a
+     RelWithDebInfo-style config wants and what a mismatched /MDd build would
+     fail loudly on anyway.  Two flavours rather than one because
+     rt/parse.hpp hands back a type holding a boost::container::static_vector by
+     value, so the CRT the DLL was built against has to be the CRT the caller
+     was.
+
+     The compile options below are not preferences.  They are the ones
+     cmake/EinsumCompileOptions.cmake builds the library with, restated for a
+     consumer who reaches the headers through MSBuild instead of CMake -- and
+     restated rather than exported, because that file attaches its flags
+     PRIVATE.  CMakeLists.txt puts this same list on the einsum INTERFACE target
+     for the find_package() path; keep the two in step.
+
+     They matter here because the einsum they govern is the one that runs in the
+     *consumer's* translation units.  einsum is headers but for one: the whole
+     compile-time planner behind einsum("ij,jk->ik"_ct) is constant evaluation
+     in their TU, against MSVC's evaluator -- the one with the lowest default
+     budget of the three -- and util/error.hpp builds the errc table with
+     Boost.Preprocessor SEQ macros, which the traditional preprocessor reaches
+     only through workaround headers.
+
+     Deliberately NOT restated:
+       /arch:AVX2  -- einsum_rt's own codegen.  The DLL requires AVX2 and the
+                      nuspec says so; silently raising the consumer's CPU floor
+                      is a different promise.  No Eigen type crosses the DLL
+                      boundary, so there is no alignment ABI to keep in step.
+       /EHs-c- /D_HAS_EXCEPTIONS=0 /wd4577
+                   -- the library is built without exceptions.  A consumer with
+                      them on simply gets a Boost that throws inline in its own
+                      TU instead of calling the boost::throw_exception
+                      einsum_rt supplies; self-consistent either way, and
+                      forcing a consumer's exception model is not ours to do.
+       /W4, /external:anglebrackets, /external:W0
+                   -- the consumer's warning policy, not ours.
+
+     No EINSUM_BUILDING either: util/export.hpp makes EINSUM_API dllimport by
+     that macro's absence, which is exactly what a consumer wants. -->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <EinsumCfg>Release</EinsumCfg>
+    <EinsumCfg Condition="'$(Configuration)' == 'Debug'">Debug</EinsumCfg>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- One directory, holding einsum/, boost/, Eigen/, experimental/ and
+           mdspan/ side by side: cmake/EinsumInstall.cmake vendors the subsets
+           our public headers reach into the prefix's own include directory, so
+           there is no versioned boost-1_XX/ and no eigen3/ to name. -->
+      <AdditionalIncludeDirectories>$(MSBuildThisFileDirectory)include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard Condition="'%(LanguageStandard)' == '' or '%(LanguageStandard)' == 'Default'">stdcpplatest</LanguageStandard>
+      <PreprocessorDefinitions>EIGEN_MPL2_ONLY;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/bigobj /utf-8 /Zc:preprocessor /Zc:__cplusplus /constexpr:steps10000000 /constexpr:depth2048 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(MSBuildThisFileDirectory)lib\x64\$(EinsumCfg)\einsum_rt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <Target Name="EinsumCheckToolchain" BeforeTargets="ClCompile">
+    <Error Condition="'$(Platform)' != 'x64'"
+           Text="the einsum package carries x64 binaries only; the active platform is '$(Platform)'" />
+    <!-- The same floor cmake/EinsumToolchainProbes.cmake states, for the same
+         reason: below 19.38 there is no &lt;expected&gt;, no
+         std::views::enumerate and no std::from_range, and the failure without
+         this is a wall of template errors inside ct/subscripts.hpp. -->
+    <Error Condition="'$(VCToolsVersion)' != '' and $([System.Version]::Parse('$(VCToolsVersion)').CompareTo($([System.Version]::Parse('14.38')))) &lt; 0"
+           Text="einsum needs MSVC 19.38 / Visual Studio 17.8+ for &lt;expected&gt;, std::views::enumerate and std::from_range (this project builds with VC tools $(VCToolsVersion))" />
+  </Target>
+  <!-- There is no rpath on this platform: the loader looks beside the binary,
+       and is told nothing else. -->
+  <Target Name="EinsumCopyDll" AfterTargets="Build" Condition="'$(OutDir)' != ''">
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)bin\x64\$(EinsumCfg)\einsum_rt.dll"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>

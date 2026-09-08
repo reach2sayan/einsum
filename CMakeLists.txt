@@ -77,6 +77,30 @@ target_link_libraries(einsum INTERFACE
 target_compile_definitions(einsum INTERFACE $<INSTALL_INTERFACE:EIGEN_MPL2_ONLY>)
 target_compile_features(einsum INTERFACE cxx_std_23)
 
+# The flags in EinsumCompileOptions.cmake are attached PRIVATE, which is right
+# for the ones that decide how *this* project is compiled and wrong for the few
+# that decide whether a consumer compiles at all.  einsum is headers but for one
+# translation unit: the whole compile-time planner behind einsum("ij,jk->ik"_ct)
+# is constant evaluation in the consumer's own TU, against MSVC's evaluator --
+# the one with the lowest default budget of the three -- and util/error.hpp
+# builds the errc table with Boost.Preprocessor SEQ macros, which the
+# traditional preprocessor reaches only through workaround headers.  So MSVC
+# needs these on the far side of the interface, and contrib/nuget/einsum.targets
+# restates the same list for a consumer arriving through MSBuild instead.  Keep
+# the two in step.
+#
+# Not here, deliberately: /arch:AVX2 is einsum_rt's own codegen and putting it
+# on a consumer would raise their CPU floor silently; /EHs-c- and
+# _HAS_EXCEPTIONS=0 are this project's choice and not one to impose -- a
+# consumer compiling with exceptions gets a Boost that throws inline in its own
+# TU rather than calling the boost::throw_exception einsum_rt supplies, which is
+# self-consistent either way; /W4 and the /external:* pair are their warning
+# policy, not ours.
+target_compile_options(einsum INTERFACE
+        $<$<CXX_COMPILER_ID:MSVC>:
+        /bigobj /utf-8 /Zc:preprocessor /Zc:__cplusplus
+        /constexpr:steps10000000 /constexpr:depth2048>)
+
 # --- the vendored header list ------------------------------------------------
 # What an installed einsum ships is decided by scripts/vendor_headers.py, and a
 # public header naming a library it did not before leaves that list stale --

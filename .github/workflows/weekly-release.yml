@@ -5,11 +5,13 @@
 # a red main is never released: the CMake workflow must have passed on HEAD.
 # "Run workflow" is the same thing on demand.
 #
-# Note what "passed" means while the Windows legs are non-blocking: they carry
-# continue-on-error, so the CMake workflow concludes success whatever MSVC did.
-# That is the intended reading for now -- Windows is watched, not promised, and
-# it must not hold up a release.  When those legs go blocking (CONTRIBUTING.md
-# says how) this gate tightens on its own, with no change here.
+# The green check means what it says now that `MSVC 2022 (release)` has lost its
+# continue-on-error: while it carried that flag the CMake workflow concluded
+# success whatever cl.exe did, so this gate could not tell a working Windows
+# build from a broken one and released either way.  It tightened on its own when
+# that flag came off, with no change here.  `python bindings (Windows)` is still
+# advisory and still masked, which is deliberate -- nothing a release ships
+# depends on it.
 #
 # The bump is pushed over SSH with the release-agent deploy key
 # (RELEASE_DEPLOY_KEY holds the private half): main is ruled "changes must be
