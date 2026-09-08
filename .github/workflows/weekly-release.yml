@@ -9,9 +9,10 @@
 # continue-on-error: while it carried that flag the CMake workflow concluded
 # success whatever cl.exe did, so this gate could not tell a working Windows
 # build from a broken one and released either way.  It tightened on its own when
-# that flag came off, with no change here.  `python bindings (Windows)` is still
-# advisory and still masked, which is deliberate -- nothing a release ships
-# depends on it.
+# that flag came off, with no change here.  `python bindings (Windows)` has since
+# lost the same flag, so the gate now also holds a release for a broken Windows
+# extension build -- which is the point: the Windows wheel Release publishes is
+# that build, packaged.
 #
 # The bump is pushed over SSH with the release-agent deploy key
 # (RELEASE_DEPLOY_KEY holds the private half): main is ruled "changes must be
