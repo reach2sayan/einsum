@@ -96,10 +96,13 @@ template <typename T>
 // At the shape the lowering chose -- the rank the subscript implies, not any
 // operand's -- which is why "i,j->ij" is an array here and not an error.
 template <typename T> [[nodiscard]] pyb::array_t<T> empty_like(const Shape &shape) {
-  const std::vector<pyb::ssize_t> extents{
-      std::from_range,
-      shape | std::views::transform(
-                  [](const index_t e) { return static_cast<pyb::ssize_t>(e); })};
+  // ranges::to, not the from_range ctor: libstdc++ 14 has yet to grow the
+  // container range constructors, and FixedVec is the only one here that has.
+  const auto extents =
+      shape | std::views::transform([](const index_t e) {
+        return static_cast<pyb::ssize_t>(e);
+      }) |
+      std::ranges::to<std::vector<pyb::ssize_t>>();
   return pyb::array_t<T>{extents};
 }
 

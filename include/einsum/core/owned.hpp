@@ -74,14 +74,16 @@ template <COperand X>
     if (!fitted) {
       return propagate<X>(fitted.error());
     }
+    // in_place: an mdarray of all-static extents carries an uninitialised
+    // dummy byte that a move would copy, and -Wmaybe-uninitialized sees it.
     if constexpr (rank_v<B> == 0) {
-      return B{typename B::extents_type{}};
+      return result<X>{std::in_place, typename B::extents_type{}};
     } else {
       std::array<std::size_t, rank_v<B>> ext{};
       std::ranges::transform(*fitted, ext.begin(), [](const index_t e) {
         return static_cast<std::size_t>(e);
       });
-      return B{typename B::extents_type{ext}};
+      return result<X>{std::in_place, typename B::extents_type{ext}};
     }
   } else if constexpr (CEigenTensor<B>) {
     const auto fitted = fit_shape(shape, rank_v<B>);
