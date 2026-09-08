@@ -235,6 +235,54 @@ void bm_einsum_transpose(benchmark::State &state) {
   }
 }
 
+// The two lowerings that are not a product, each beside the Eigen call a
+// reader would have written instead.  They are here because nothing else in
+// this file measures them: ReduceKernel and PermuteKernel spent a release
+// summing and copying through a Map with a *dynamic* inner stride, which Eigen
+// will not vectorise, and a 7x on "ij->i" went unnoticed until a Python-level
+// comparison against numpy went looking.  A family with no floor beside it
+// only catches a regression someone thought to diff against history; one with
+// a floor catches it on the first run.
+void bm_einsum_reduce(benchmark::State &state) {
+  const auto n = static_cast<Eigen::Index>(state.range(0));
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> x(n,
+                                                                           n);
+  x.setOnes();
+  const auto ein = es::einsum<"ij->i">();
+  for (auto _ : state) {
+    auto out = ein(x);
+    benchmark::DoNotOptimize(out->data());
+    benchmark::ClobberMemory();
+  }
+}
+
+void bm_rowsum_eigen(benchmark::State &state) {
+  const auto n = static_cast<Eigen::Index>(state.range(0));
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> x(n,
+                                                                           n);
+  Eigen::Matrix<double, Eigen::Dynamic, 1> v(n);
+  x.setOnes();
+  for (auto _ : state) {
+    v.noalias() = x.rowwise().sum();
+    benchmark::DoNotOptimize(v.data());
+    benchmark::ClobberMemory();
+  }
+}
+
+void bm_transpose_eigen(benchmark::State &state) {
+  constexpr int n = 64;
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> x(n,
+                                                                           n);
+  Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> y(n,
+                                                                           n);
+  x.setOnes();
+  for (auto _ : state) {
+    y.noalias() = x.transpose();
+    benchmark::DoNotOptimize(y.data());
+    benchmark::ClobberMemory();
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -244,6 +292,15 @@ int main(int argc, char **argv) {
                                bm_einsum_batched);
   benchmark::RegisterBenchmark("BM_einsum_transpose_double_64",
                                bm_einsum_transpose);
+  benchmark::RegisterBenchmark("BM_transpose_eigen_double_64",
+                               bm_transpose_eigen);
+  // 512, where a row is long enough that how it is summed is the whole cost.
+  benchmark::RegisterBenchmark("BM_einsum_reduce_double", bm_einsum_reduce)
+      ->Arg(64)
+      ->Arg(512);
+  benchmark::RegisterBenchmark("BM_rowsum_eigen_double", bm_rowsum_eigen)
+      ->Arg(64)
+      ->Arg(512);
 
   benchmark::Initialize(&argc, argv);
   if (benchmark::ReportUnrecognizedArguments(argc, argv)) {

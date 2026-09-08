@@ -36,12 +36,40 @@ using CColMap = Eigen::Map<
     const Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>,
     Eigen::Unaligned, Eigen::OuterStride<>>;
 
-template <CScalar T>
-using VecMap = Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>, Eigen::Unaligned,
-                          Eigen::InnerStride<>>;
-template <CScalar T>
+// Eigen vectorises a vector Map whose inner stride is 1 *in the type*; one
+// holding 1 in an InnerStride<> at run time it has to walk element by element.
+// That is not a small difference -- summing 512 rows of 512 doubles measures
+// 338us against 48us -- and every stride here is a runtime value, so the unit
+// case has to be recovered rather than assumed.  Hence the stride parameter:
+// the maps below are named with a stride *type*, and with_inner_stride picks
+// which one, once, outside the loop that uses it.
+template <CScalar T, typename Stride = Eigen::InnerStride<>>
+using VecMap =
+    Eigen::Map<Eigen::Matrix<T, Eigen::Dynamic, 1>, Eigen::Unaligned, Stride>;
+template <CScalar T, typename Stride = Eigen::InnerStride<>>
 using CVecMap = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>,
-                           Eigen::Unaligned, Eigen::InnerStride<>>;
+                           Eigen::Unaligned, Stride>;
+
+// A row vector, for the one product Eigen recognises only from the types.
+template <CScalar T>
+using CRowVecMap = Eigen::Map<const Eigen::Matrix<T, 1, Eigen::Dynamic>,
+                              Eigen::Unaligned, Eigen::InnerStride<>>;
+
+// A side that is packed by construction: contiguous, and known so at compile
+// time, which is the whole point of packing it.
+using Unit = Eigen::InnerStride<1>;
+
+// Hands `f` an Eigen inner stride whose *type* says whether it is one.  Two
+// instantiations of the body, and the branch is paid once rather than per
+// element.
+template <typename F>
+constexpr void with_inner_stride(const index_t stride, F &&f) noexcept {
+  if (stride == 1) {
+    f(Unit{});
+  } else {
+    f(Eigen::InnerStride<>{stride});
+  }
+}
 
 // The compile-time path's maps: every extent in the type, so the product is
 // unrolled rather than blocked.  A single column has to be column-major and a
@@ -81,34 +109,44 @@ void shuffle(PackedPtr<D, T> packed, StridedPtr<D, T> strided,
              const Layout &rows, const Layout &cols) noexcept {
   const Collapsed run = collapse(cols);
   const index_t cols_n = cols.size();
-  index_t r = 0;
-  for_each_offset(
-      [&](const index_t row_offset) noexcept {
-        auto *line = strided + row_offset;
-        auto *flat = packed + r++ * cols_n;
-        if (run.ok) {
-          if constexpr (D == Direction::gather) {
-            VecMap<T>{flat, cols_n, Eigen::InnerStride<>{1}} =
-                CVecMap<T>{line, cols_n, Eigen::InnerStride<>{run.stride}};
-          } else {
-            VecMap<T>{line, cols_n, Eigen::InnerStride<>{run.stride}} =
-                CVecMap<T>{flat, cols_n, Eigen::InnerStride<>{1}};
-          }
+  // The packed side is contiguous by definition, so it is a Unit map and not a
+  // dynamic 1; the strided side is dispatched on, and both -- along with the
+  // run.ok branch -- are the same for every row.
+  const auto lines = [&](auto &&body) noexcept {
+    index_t r = 0;
+    for_each_offset(
+        [&](const index_t row_offset) noexcept {
+          body(strided + row_offset, packed + r++ * cols_n);
+        },
+        rows);
+  };
+  if (run.ok) {
+    with_inner_stride(run.stride, [&](const auto stride) noexcept {
+      lines([&](auto *line, auto *flat) noexcept {
+        if constexpr (D == Direction::gather) {
+          VecMap<T, Unit>{flat, cols_n} =
+              CVecMap<T, decltype(stride)>{line, cols_n, stride};
         } else {
-          index_t c = 0;
-          for_each_offset(
-              [&](const index_t col_offset) noexcept {
-                if constexpr (D == Direction::gather) {
-                  flat[c] = line[col_offset];
-                } else {
-                  line[col_offset] = flat[c];
-                }
-                ++c;
-              },
-              cols);
+          VecMap<T, decltype(stride)>{line, cols_n, stride} =
+              CVecMap<T, Unit>{flat, cols_n};
         }
-      },
-      rows);
+      });
+    });
+    return;
+  }
+  lines([&](auto *line, auto *flat) noexcept {
+    index_t c = 0;
+    for_each_offset(
+        [&](const index_t col_offset) noexcept {
+          if constexpr (D == Direction::gather) {
+            flat[c] = line[col_offset];
+          } else {
+            line[col_offset] = flat[c];
+          }
+          ++c;
+        },
+        cols);
+  });
 }
 
 // One GEMM per batch.  The nested dispatches pick each operand's Map order, so
@@ -168,7 +206,18 @@ struct GemmKernel {
               with_out(a, CRowMap<T>{rp, k, n, Eigen::OuterStride<>{r_outer}});
             }
           };
-          if (l_col) {
+          // k == 1 is a rank-one update, and Eigen knows that only from the
+          // types: an (m x 1) by (1 x n) product of two *matrix* maps is
+          // packed and blocked like any GEMM -- 87us for 512 x 512 -- where
+          // the same product of a column vector by a row vector takes its
+          // outer-product path, one scaled row copy per row, 27us: the cost
+          // of the write.  The vector's stride is whichever of the matrix's
+          // two the single column or row runs along.
+          if (k == 1) {
+            with_out(CVecMap<T>{lp, m, Eigen::InnerStride<>{l_col ? 1 : l_outer}},
+                     CRowVecMap<T>{rp, n,
+                                   Eigen::InnerStride<>{r_col ? r_outer : 1}});
+          } else if (l_col) {
             with_right(CColMap<T>{lp, m, k, Eigen::OuterStride<>{l_outer}});
           } else {
             with_right(CRowMap<T>{lp, m, k, Eigen::OuterStride<>{l_outer}});
@@ -221,22 +270,31 @@ static_assert(CStepKernel<HadamardKernel, double>);
 struct ReduceKernel {
   template <CScalar T>
   static void run(const PrepGeom &pg, const T *src, T *dst) noexcept {
+    // Whether there is a single stride, and what it is, are the same for every
+    // row -- so both are settled out here, and the row loop is one sum with
+    // nothing left to decide.
+    if (pg.red_run.ok) {
+      with_inner_stride(pg.red_run.stride, [&](const auto stride) noexcept {
+        index_t i = 0;
+        for_each_offset(
+            [&](const index_t keep_offset) noexcept {
+              dst[i++] = CVecMap<T, decltype(stride)>{
+                  src + keep_offset, pg.red_run.extent, stride}
+                             .sum();
+            },
+            pg.keep);
+      });
+      return;
+    }
+    // No single stride, so no vector for Eigen to sum.
     index_t i = 0;
     for_each_offset(
         [&](const index_t keep_offset) noexcept {
           const T *base = src + keep_offset;
-          if (pg.red_run.ok) {
-            dst[i] = CVecMap<T>{base, pg.red_run.extent,
-                                Eigen::InnerStride<>{pg.red_run.stride}}
-                         .sum();
-          } else {
-            // No single stride, so no vector for Eigen to sum.
-            T acc{};
-            for_each_offset(
-                [&](const index_t red) noexcept { acc += base[red]; }, pg.red);
-            dst[i] = acc;
-          }
-          ++i;
+          T acc{};
+          for_each_offset([&](const index_t red) noexcept { acc += base[red]; },
+                          pg.red);
+          dst[i++] = acc;
         },
         pg.keep);
   }
@@ -264,12 +322,18 @@ struct PermuteKernel {
                     .strides = Shape{std::from_range,
                                      lay.strides | std::views::take(rank - 1)}};
     };
-    for_each_offset(
-        [&](const index_t to, const index_t from) noexcept {
-          VecMap<T>{dst.data + to, inner, Eigen::InnerStride<>{dst_step}} =
-              CVecMap<T>{src + from, inner, Eigen::InnerStride<>{src_step}};
-        },
-        but_last(dst.layout), but_last(src_layout));
+    // Both steps are the same for every line, and a transpose is exactly the
+    // case where one of the two is 1: settled here rather than per element.
+    with_inner_stride(dst_step, [&](const auto to_step) noexcept {
+      with_inner_stride(src_step, [&](const auto from_step) noexcept {
+        for_each_offset(
+            [&](const index_t to, const index_t from) noexcept {
+              VecMap<T, decltype(to_step)>{dst.data + to, inner, to_step} =
+                  CVecMap<T, decltype(from_step)>{src + from, inner, from_step};
+            },
+            but_last(dst.layout), but_last(src_layout));
+      });
+    });
   }
 };
 

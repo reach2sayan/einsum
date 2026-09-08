@@ -4,7 +4,7 @@ einsum's runtime path: a subscript parsed at run time, and the object it answers
 from __future__ import annotations
 import enum
 import typing
-__all__: list[str] = ['Einsum', 'Error', 'MAX_OPERANDS', 'MAX_RANK', 'Path', 'einsum', 'errc', 'parse_subscript']
+__all__: list[str] = ['Einsum', 'Error', 'MAX_OPERANDS', 'MAX_RANK', 'OPENMP', 'Path', 'einsum', 'errc', 'get_num_threads', 'parse_subscript', 'set_num_threads']
 class Einsum:
     """
     A parsed subscript.  Call it with arrays.
@@ -74,10 +74,19 @@ def einsum(subscripts: str, *, path: Path = ...) -> Einsum:
     """
     Parse a subscript and hand back the object that runs it.
     """
+def get_num_threads() -> int:
+    """
+    How many threads a matrix product will use.  1 in a build without OpenMP.
+    """
 def parse_subscript(subscripts: str) -> str:
     """
     The subscript, parsed and written back out.  Raises Error with the code the grammar refused with.
     """
+def set_num_threads(n: typing.SupportsInt | typing.SupportsIndex) -> None:
+    """
+    How many threads a matrix product may use; 0 hands the choice back to OpenMP.  A no-op in a build without OpenMP.
+    """
 MAX_OPERANDS: int = 8
 MAX_RANK: int = 8
+OPENMP: bool = True
 __version__: str = '2.0.0'

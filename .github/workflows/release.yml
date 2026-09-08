@@ -15,9 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: The tag and project(EinsteinSummation VERSION ...) must agree
+      - name: The tag and project(einsum VERSION ...) must agree
         run: |
-          written=$(sed -n 's/^project(EinsteinSummation VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          written=$(sed -n 's/^project(einsum VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
           tagged="${GITHUB_REF_NAME#v}"
           test "$written" = "$tagged" || {
             echo "CMakeLists.txt says $written, the tag says $tagged"; exit 1; }

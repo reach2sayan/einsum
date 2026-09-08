@@ -111,6 +111,18 @@ endmacro()
 # --- mdspan ------------------------------------------------------------------
 # No libstdc++ on the floor ships <mdspan>, so the reference implementation is
 # not a convenience here.
+# The one dependency that is not a header: Eigen's GEMM runs its blocks on an
+# OpenMP team when the translation unit that instantiates it was compiled with
+# -fopenmp, and on the calling thread otherwise -- there is no runtime switch,
+# and no source change on either side.  So this is a property of *consumers'*
+# compiles, and the target carries it as INTERFACE.  The team is sized by
+# OMP_NUM_THREADS, or by einsum.set_num_threads() from Python.
+macro(einsum_use_openmp)
+    if (NOT TARGET OpenMP::OpenMP_CXX)
+        find_package(OpenMP REQUIRED COMPONENTS CXX)
+    endif ()
+endmacro()
+
 macro(einsum_use_mdspan)
     if (NOT TARGET mdspan::mdspan)
         set(MDSPAN_ENABLE_TESTS OFF CACHE BOOL "" FORCE)

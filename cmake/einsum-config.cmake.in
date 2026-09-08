@@ -3,6 +3,14 @@
 # Nothing to find: Boost, Eigen and mdspan were installed into this prefix's
 # include directory beside einsum's own headers, so the one include path the
 # targets below carry is all of them.  See cmake/EinsumInstall.cmake.
+#
+# Except OpenMP, which is a compiler flag rather than a header: an install
+# configured with EINSUM_OPENMP hands einsum::einsum an OpenMP::OpenMP_CXX
+# link, and that target has to exist in the consumer's configure too.
+if (@EINSUM_OPENMP@)
+    include(CMakeFindDependencyMacro)
+    find_dependency(OpenMP COMPONENTS CXX)
+endif ()
 include("${CMAKE_CURRENT_LIST_DIR}/einsumTargets.cmake")
 
 set(einsum_einsum_FOUND TRUE)

@@ -88,6 +88,39 @@ add_test(NAME python.pytest
         "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 set_tests_properties(python.pytest PROPERTIES ENVIRONMENT "${EINSUM_PYTEST_ENV}")
 
+# --- the comparison suite, on request ----------------------------------------
+# Not a ctest: it takes minutes, it needs `uv sync --group bench`, and a number
+# is neither a pass nor a fail.  The Python counterpart of benchmark/'s
+# benchmark_json target.  SKBUILD is set by scikit-build-core, where the wheel
+# build turns EINSUM_BUILD_PYTHON on as well and none of this is its business.
+# The thread pools have to be pinned in the environment: OpenBLAS sizes its
+# pool when it loads, so benchmarks/conftest.py can only check, not fix.
+if (NOT SKBUILD)
+    add_custom_target(python_benchmark_json
+            COMMAND ${CMAKE_COMMAND} -E env ${EINSUM_PYTEST_ENV}
+            "OMP_NUM_THREADS=1" "OPENBLAS_NUM_THREADS=1" "MKL_NUM_THREADS=1"
+            # And the allocator, for the same reason as the thread pools: a
+            # result big enough to be mmapped is handed back to the kernel on
+            # free, so the next call faults in fresh zeroed pages.  That is a
+            # real cost, but it is not one every process pays -- importing
+            # torch alone retunes glibc and moves this suite's matmul_256 row
+            # by 2.5x -- so it is pinned rather than left to whatever the
+            # imports did.  glibc reads these at startup: they have to be in
+            # the environment, which is why they are here and not in conftest.
+            "MALLOC_MMAP_THRESHOLD_=67108864"
+            "MALLOC_TRIM_THRESHOLD_=67108864"
+            "${Python_EXECUTABLE}" -m pytest -q
+            "${CMAKE_CURRENT_SOURCE_DIR}/benchmarks"
+            --benchmark-group-by=param:case
+            --benchmark-columns=min,median,ops
+            --benchmark-sort=min
+            --benchmark-warmup=on --benchmark-disable-gc
+            --benchmark-json=${CMAKE_CURRENT_BINARY_DIR}/benchmark.json
+            DEPENDS einsum_python_package
+            COMMENT "Running the Python comparison suite into benchmark.json"
+            VERBATIM)
+endif ()
+
 # --- stubs -------------------------------------------------------------------
 # On request; the result is checked in.  Against the bare extension, not the
 # package, so what it describes is what the C++ actually exports.

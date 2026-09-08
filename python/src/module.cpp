@@ -8,6 +8,8 @@
 #include "einsum/rt/parse.hpp"
 #include "einsum/util/error.hpp"
 
+#include <Eigen/Core>
+
 #include <pybind11/native_enum.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -100,6 +102,28 @@ PYBIND11_MODULE(_einsum, m) {
   // What a plan costs whether or not a subscript uses them.
   m.attr("MAX_RANK") = ei::kMaxRank;
   m.attr("MAX_OPERANDS") = ei::kMaxOperands;
+
+  // The thread team is Eigen's: set_num_threads is Eigen::setNbThreads, and
+  // until it is called OpenMP sizes the team from OMP_NUM_THREADS.  Without
+  // OpenMP in the build the pair stays honest -- Eigen answers 1 and drops the
+  // setter -- and OPENMP says which build this is, so nobody has to find out
+  // by timing.  initParallel is Eigen's one-time setup for being called from
+  // several threads, which a Python process can do.
+#ifdef _OPENMP
+  Eigen::initParallel();
+  m.attr("OPENMP") = true;
+#else
+  m.attr("OPENMP") = false;
+#endif
+  m.def(
+      "set_num_threads", [](const int n) { Eigen::setNbThreads(n); },
+      pyb::arg("n"),
+      pyb::doc("How many threads a matrix product may use; 0 hands the choice "
+               "back to OpenMP.  A no-op in a build without OpenMP."));
+  m.def(
+      "get_num_threads", [] { return Eigen::nbThreads(); },
+      pyb::doc("How many threads a matrix product will use.  1 in a build "
+               "without OpenMP."));
 
   // A translator, not register_exception: the code goes on the instance.
   ep::error_class =

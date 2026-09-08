@@ -16,7 +16,7 @@ if (NOT CMAKE_HOST_WIN32
     endif ()
 endif ()
 
-project(EinsteinSummation VERSION 2.0.0 LANGUAGES CXX)
+project(einsum VERSION 2.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,6 +37,10 @@ include(EinsumDependencies)
 option(EINSUM_BUILD_TESTS "Build the Boost.Test suites" ON)
 option(EINSUM_BUILD_BENCHMARKS "Build the Google Benchmark suite" ON)
 option(EINSUM_BUILD_PYTHON "Build the pybind11 extension module" OFF)
+# Off here, on in the Linux wheel (pyproject.toml) and the python preset.  A
+# library that spawns threads is a different thing from one that does not, so
+# a plain configure gets the one it always had.  See einsum_use_openmp.
+option(EINSUM_OPENMP "Run Eigen's GEMM on an OpenMP team" OFF)
 
 # --- the header-only library -------------------------------------------------
 einsum_use_boost()
@@ -45,6 +49,10 @@ einsum_use_mdspan()
 
 add_library(einsum INTERFACE)
 add_library(einsum::einsum ALIAS einsum)
+if (EINSUM_OPENMP)
+    einsum_use_openmp()
+    target_link_libraries(einsum INTERFACE OpenMP::OpenMP_CXX)
+endif ()
 
 # Every header under include/, found rather than listed: the list drifted once
 # already -- core/kind.hpp was written, not added, and only an install noticed.

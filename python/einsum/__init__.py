@@ -21,6 +21,11 @@ F-ordered, sliced, transposed, reversed. Only a broadcast view is materialised.
 
 The result comes back at the rank the *subscript* implies, so ``"i,j->ij"`` and
 ``"ij,kl->ijkl"`` are arrays here and not errors.
+
+A build with ``OPENMP`` true runs each matrix product on a thread team, sized
+by ``OMP_NUM_THREADS`` or ``set_num_threads``. The answer differs from the
+single-threaded one only by rounding -- the blocks sum in another order. The
+Linux wheel is such a build, the Windows one is not.
 """
 
 from __future__ import annotations
@@ -31,12 +36,15 @@ from typing import TYPE_CHECKING
 from ._einsum import (
     MAX_OPERANDS,
     MAX_RANK,
+    OPENMP,
     Einsum,
     Path,
     __version__,
     einsum,
     errc,
+    get_num_threads,
     parse_subscript,
+    set_num_threads,
 )
 
 if TYPE_CHECKING:
@@ -57,6 +65,7 @@ else:
 __all__ = [
     "MAX_OPERANDS",
     "MAX_RANK",
+    "OPENMP",
     "Einsum",
     "Error",
     "Path",
@@ -64,7 +73,9 @@ __all__ = [
     "contract",
     "einsum",
     "errc",
+    "get_num_threads",
     "parse_subscript",
+    "set_num_threads",
 ]
 
 

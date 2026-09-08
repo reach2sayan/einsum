@@ -47,6 +47,7 @@
       "cacheVariables": {
         "EINSUM_BUILD_PYTHON": "ON",
         "EINSUM_BUILD_BENCHMARKS": "OFF",
+        "EINSUM_OPENMP": "ON",
         "Python_ROOT_DIR": "${sourceDir}/.venv",
         "Python_FIND_VIRTUALENV": "ONLY"
       }

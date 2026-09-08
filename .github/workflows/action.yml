@@ -115,7 +115,7 @@ jobs:
           max-size: 500M
 
       # C:/d, not the workspace: Boost unpacked under
-      # D:\a\Einstein_Summation\Einstein_Summation\.deps\boost-1.92.0\... runs
+      # D:\a\einsum\einsum\.deps\boost-1.92.0\... runs
       # into MAX_PATH long before the compiler sees any of it.
       - name: Cache the pinned dependencies
         uses: actions/cache@v4

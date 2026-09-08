@@ -21,7 +21,7 @@ def test_py_typed_ships():
 
 def test_one_version():
     written = Path(__file__).parents[2] / "CMakeLists.txt"
-    found = re.search(r"project\(EinsteinSummation VERSION ([0-9.]+)",
+    found = re.search(r"project\(einsum VERSION ([0-9.]+)",
                       written.read_text())
     assert found is not None
     assert einsum.__version__ == found.group(1)

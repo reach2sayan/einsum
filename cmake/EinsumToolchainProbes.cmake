@@ -45,7 +45,7 @@ check_cxx_source_compiles(
 if (NOT EINSUM_TOOLCHAIN_OK)
     message(FATAL_ERROR
             "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} cannot build "
-            "EinsteinSummation, which needs <expected>, std::views::enumerate and "
+            "einsum, which needs <expected>, std::views::enumerate and "
             "std::from_range.  Build with GCC 14+, MSVC 19.38+ (Visual Studio 2022 "
             "17.8), or Clang 20+ against libstdc++ 14+ -- with clang it is the "
             "standard library that decides, not the compiler, so a new clang paired "

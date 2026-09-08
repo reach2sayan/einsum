@@ -588,3 +588,12 @@ _skbuild/
 # but a stray in-source configure would put them here, and they are artifacts.
 /python/einsum/*.so
 /python/einsum/*.pyd
+
+# Prose: README.md is the only Markdown this repo carries.  Scratch notes, design
+# write-ups and generated reports all land as .md in the tree, and none of them
+# is worth a commit -- so the default is ignored and the one file is the
+# exception.  A .md that does earn tracking needs a `!` line here beside it, or
+# `git add -f`.  Already-tracked Markdown is unaffected: .gitignore does not
+# reach a file git is following.
+*.md
+!README.md
