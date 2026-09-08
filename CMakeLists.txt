@@ -65,6 +65,42 @@ target_link_libraries(einsum INTERFACE
 target_compile_definitions(einsum INTERFACE $<INSTALL_INTERFACE:EIGEN_MPL2_ONLY>)
 target_compile_features(einsum INTERFACE cxx_std_23)
 
+# --- the vendored header list ------------------------------------------------
+# What an installed einsum ships is decided by scripts/vendor_headers.py, and a
+# public header naming a library it did not before leaves that list stale --
+# which CI catches, but only after a push.  So the build checks it too.
+#
+# Checked, never rewritten: the list is the compiler's include closure on one
+# machine, and a build that regenerated it would make a tracked file depend on
+# who built last.  The stamp is what keeps this off the hot path -- the script
+# runs a compiler, so it reruns only when a public header, the pins, the script
+# or the list itself changes.
+option(EINSUM_CHECK_VENDORED_HEADERS
+        "Fail the build when cmake/EinsumVendoredHeaders.cmake is stale"
+        ${PROJECT_IS_TOP_LEVEL})
+if (EINSUM_CHECK_VENDORED_HEADERS)
+    find_package(Python 3.11 QUIET COMPONENTS Interpreter)
+    if (NOT Python_Interpreter_FOUND)
+        message(STATUS "einsum: no Python 3.11+; not checking the vendored "
+                "header list")
+    else ()
+        set(EINSUM_VENDORED_STAMP
+                "${CMAKE_CURRENT_BINARY_DIR}/vendored_headers.stamp")
+        add_custom_command(OUTPUT "${EINSUM_VENDORED_STAMP}"
+                COMMAND "${Python_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vendor_headers.py" --check
+                COMMAND "${CMAKE_COMMAND}" -E touch "${EINSUM_VENDORED_STAMP}"
+                DEPENDS ${EINSUM_HEADERS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/vendor_headers.py"
+                "${CMAKE_CURRENT_LIST_DIR}/cmake/EinsumVendoredHeaders.cmake"
+                "${CMAKE_CURRENT_LIST_DIR}/cmake/EinsumDependencies.cmake"
+                COMMENT "Checking the vendored header list"
+                VERBATIM)
+        add_custom_target(einsum_vendored_headers ALL
+                DEPENDS "${EINSUM_VENDORED_STAMP}")
+    endif ()
+endif ()
+
 # --- libeinsum_rt ------------------------------------------------------------
 add_subdirectory(src/rt)
 

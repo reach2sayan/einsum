@@ -179,5 +179,5 @@ jobs:
           CXX: g++-14
         run: |
           uv venv --python 3.12 /tmp/wheel
-          VIRTUAL_ENV=/tmp/wheel uv pip install .
+          VIRTUAL_ENV=/tmp/wheel uv pip install . pytest
           cd /tmp && /tmp/wheel/bin/python -m pytest -q "$GITHUB_WORKSPACE/python/tests"
