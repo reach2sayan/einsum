@@ -1,5 +1,13 @@
 # einsum
 
+[![CI](https://github.com/reach2sayan/einsum/actions/workflows/action.yml/badge.svg?branch=main)](https://github.com/reach2sayan/einsum/actions/workflows/action.yml)
+[![NuGet](https://img.shields.io/nuget/v/einsum?logo=nuget&logoColor=white)](https://www.nuget.org/packages/einsum)
+[![C++23](https://img.shields.io/badge/C%2B%2B-23-00599C?logo=cplusplus&logoColor=white)](#requirements)
+[![CMake](https://img.shields.io/badge/CMake-3.26%2B-064F8C?logo=cmake&logoColor=white)](#requirements)
+[![Compilers](https://img.shields.io/badge/compilers-GCC%2014%2B%20%7C%20Clang%2020%2B%20%7C%20MSVC%202022-brightgreen)](#requirements)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](#python)
+[![License](https://img.shields.io/badge/license-BSL--1.0-4B8BBE)](LICENSE.txt)
+
 A header-only einsum for C++23: one object, one call, and the result comes back
 by value in the operands' own family.
 
@@ -27,7 +35,7 @@ Every failure travels through `std::expected`; nothing in any header throws.
 
 | | |
 |---|---|
-| Compiler | GCC 14+ or Clang 20+; MSVC 2022 (17.10+) is built but not promised |
+| Compiler | GCC 14+, Clang 20+, or MSVC 2022 (17.8+) |
 | Standard | C++23 |
 | CMake | 3.26+ |
 
@@ -46,9 +54,12 @@ whatever the developer prompt put there.
 
 ### Windows
 
-MSVC builds in CI and is not gated on: the two Windows jobs carry
-`continue-on-error`, so a red Windows leg does not fail a pull request. The
-build is watched, in other words, rather than promised. There is no Windows
+MSVC is gated on. `MSVC 2022 (release)` is a required check, so a red Windows
+leg fails a pull request like any other -- the package on nuget.org is built by
+that toolchain, and a package is the strongest claim about a compiler this
+project can make. `python bindings (Windows)` is still advisory: it is a
+different question, extension loading and interpreter plumbing, and nothing a
+release ships depends on it. There is no Windows
 preset -- the presets pin no compiler, so `cmake --preset release` from a
 developer command prompt is the whole of it, and CI names `cl` on the command
 line rather than in a preset.
@@ -429,6 +440,29 @@ and that one is neither fetched nor vendored -- you asked for it, you have it.
 
 `einsum::rt` is a shared library: `libeinsum_rt.so`, one translation unit and
 two exported symbols, holding the runtime grammar.
+
+### NuGet
+
+On Windows, without CMake: `einsum` on
+[nuget.org](https://www.nuget.org/packages/einsum) is the same install prefix as
+a native package.
+
+```
+nuget install einsum          # or: Install-Package einsum
+```
+
+Referencing it is all the setup there is. NuGet imports
+`build/native/einsum.targets` into the project because the file's name matches
+the package id, and that adds the one include directory, links
+`einsum_rt.lib` for the matching CRT flavour, and copies `einsum_rt.dll` beside
+the executable after the build. Release and Debug binaries both ship, because
+the run-time API hands back a type holding a `boost::container::static_vector`
+by value and the CRT the DLL was built against has to be the CRT the caller was.
+
+x64 only, and the binaries require AVX2. The `.targets` also restates the
+compile options a consumer needs -- the constexpr budget above all, since the
+compile-time planner runs in *your* translation units -- so keep it in step with
+the `einsum` INTERFACE target in `CMakeLists.txt` if you change either.
 
 ## Benchmarks
 

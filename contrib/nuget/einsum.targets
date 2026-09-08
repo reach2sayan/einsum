@@ -4,7 +4,7 @@
      wiring.
 
      The package carries x64 binaries in the two CRT flavours, and every
-     configuration that is not Debug links Release -- which is what a
+     configuration that is not Debug links Release — which is what a
      RelWithDebInfo-style config wants and what a mismatched /MDd build would
      fail loudly on anyway.  Two flavours rather than one because
      rt/parse.hpp hands back a type holding a boost::container::static_vector by
@@ -13,7 +13,7 @@
 
      The compile options below are not preferences.  They are the ones
      cmake/EinsumCompileOptions.cmake builds the library with, restated for a
-     consumer who reaches the headers through MSBuild instead of CMake -- and
+     consumer who reaches the headers through MSBuild instead of CMake — and
      restated rather than exported, because that file attaches its flags
      PRIVATE.  CMakeLists.txt puts this same list on the einsum INTERFACE target
      for the find_package() path; keep the two in step.
@@ -21,24 +21,24 @@
      They matter here because the einsum they govern is the one that runs in the
      *consumer's* translation units.  einsum is headers but for one: the whole
      compile-time planner behind einsum("ij,jk->ik"_ct) is constant evaluation
-     in their TU, against MSVC's evaluator -- the one with the lowest default
-     budget of the three -- and util/error.hpp builds the errc table with
+     in their TU, against MSVC's evaluator — the one with the lowest default
+     budget of the three — and util/error.hpp builds the errc table with
      Boost.Preprocessor SEQ macros, which the traditional preprocessor reaches
      only through workaround headers.
 
      Deliberately NOT restated:
-       /arch:AVX2  -- einsum_rt's own codegen.  The DLL requires AVX2 and the
+       /arch:AVX2  — einsum_rt's own codegen.  The DLL requires AVX2 and the
                       nuspec says so; silently raising the consumer's CPU floor
                       is a different promise.  No Eigen type crosses the DLL
                       boundary, so there is no alignment ABI to keep in step.
        /EHs-c- /D_HAS_EXCEPTIONS=0 /wd4577
-                   -- the library is built without exceptions.  A consumer with
+                   — the library is built without exceptions.  A consumer with
                       them on simply gets a Boost that throws inline in its own
                       TU instead of calling the boost::throw_exception
                       einsum_rt supplies; self-consistent either way, and
                       forcing a consumer's exception model is not ours to do.
        /W4, /external:anglebrackets, /external:W0
-                   -- the consumer's warning policy, not ours.
+                   — the consumer's warning policy, not ours.
 
      No EINSUM_BUILDING either: util/export.hpp makes EINSUM_API dllimport by
      that macro's absence, which is exactly what a consumer wants. -->

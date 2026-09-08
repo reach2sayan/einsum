@@ -75,7 +75,14 @@ skip = "*-musllinux* *-win32 *_i686 cp3??t-*"
 build-frontend = "build[uv]"
 build-verbosity = 1
 test-requires = "pytest"
-test-command = "pytest -q {package}/python/tests"
+# The import is its own step, before pytest, because a wheel that cannot be
+# loaded fails in a way pytest cannot report: the extension is imported during
+# collection, so the process dies before pytest has written a line, and even the
+# faulthandler traceback pytest installs by default never reaches the log.  What
+# is left is `Segmentation fault` from the shell and nothing naming a cause.
+# Importing first separates "the wheel does not load here" from "a test fails",
+# and prints what the loader actually resolved when it is the former.
+test-command = "python -c \"import faulthandler, sys; faulthandler.enable(); import einsum; print('import ok:', einsum.__file__, 'on', sys.version)\" && pytest -q {package}/python/tests"
 
 # manylinux_2_28 ships GCC 12, below this project's GCC 14 floor -- the
 # toolchain probe stops the configure with a message saying so -- and
