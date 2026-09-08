@@ -103,6 +103,16 @@ environment = { CC = "/opt/rh/gcc-toolset-15/root/usr/bin/gcc", CXX = "/opt/rh/g
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64"]
+# No repair step, which is what cibuildwheel did here until v4 made delvewheel
+# the default.  There is nothing for it to carry: the one non-system dependency
+# is einsum_rt.dll, python/CMakeLists.txt installs it beside _einsum.pyd, and
+# CPython has searched an extension's own directory for its dependencies since
+# 3.8 -- which is what the wheels published so far already rely on.  Left on,
+# delvewheel stops with "Unable to find library: einsum_rt.dll": it looks for a
+# dependency on the system rather than in the wheel unless --ignore-existing is
+# passed, and with that flag it would instead vendor the MSVC runtime, which is
+# a different promise about what this wheel ships.
+repair-wheel-command = ""
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
