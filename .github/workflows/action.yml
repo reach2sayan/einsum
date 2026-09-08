@@ -57,7 +57,10 @@ jobs:
       - name: Test
         run: ctest --preset release
 
-  single-header:
+  # The install is the distribution: an installed einsum carries Boost, Eigen and
+  # mdspan, so what can rot is the list saying which parts.  This builds a
+  # consumer against the prefix and nothing else on the machine.
+  install:
     runs-on: ubuntu-24.04
     needs: build
     steps:
@@ -70,7 +73,7 @@ jobs:
       - name: Install the toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++-14
+          sudo apt-get install -y cmake ninja-build ccache g++-14
 
       - name: Cache the pinned dependencies
         uses: actions/cache@v4
@@ -79,26 +82,102 @@ jobs:
           key: ${{ runner.os }}-deps-${{ hashFiles('cmake/EinsumDependencies.cmake') }}
           restore-keys: ${{ runner.os }}-deps-
 
-      # Configure only, to unpack the pinned sources the smoke test needs on its
-      # include path.
-      - name: Fetch the dependencies
+      - name: Configure
         env:
           CXX: g++-14
         run: cmake --preset release -DEINSUM_BUILD_TESTS=OFF -DEINSUM_BUILD_BENCHMARKS=OFF
 
-      - name: Regenerate the single header
-        run: python3 scripts/amalgamate.py
+      - name: Fail if the vendored header list is stale
+        env:
+          CXX: g++-14
+        run: python3 scripts/vendor_headers.py --check
 
-      # It has to be self-contained, which is the only thing about it that can
-      # rot: no include path into include/, nothing from src/.
-      - name: Compile against the single header alone
+      - name: Build and install
         run: |
-          BOOST=$(ls -d .deps/boost-*/ | head -1)
-          EIGEN=$(ls -d .deps/eigen-*/ | head -1)
-          MDSPAN=$(ls -d .deps/mdspan-*/ | grep -v subbuild | head -1)
-          g++-14 -std=c++23 -fsyntax-only -Isingle_include \
-            -isystem "$BOOST" -isystem "$EIGEN" -isystem "${MDSPAN}include" \
-            tests/single_header_smoke.cpp
+          cmake --build --preset release
+          cmake --install build/release --prefix "$PWD/prefix"
 
-      - name: Fail if the committed single header is stale
-        run: git diff --exit-code single_include/einsum.hpp
+      # No -I into include/, no Boost, no Eigen, no mdspan: whatever the prefix
+      # does not carry, this does not compile.
+      - name: Build a consumer against the prefix alone
+        env:
+          CXX: g++-14
+        run: |
+          mkdir -p consumer && cd consumer
+          cat > CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.26)
+          project(consumer LANGUAGES CXX)
+          find_package(einsum REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE einsum::einsum einsum::rt)
+          CMAKE
+          cat > main.cpp <<'CPP'
+          #include <einsum/einsum.hpp>
+          #include <einsum/rt/parse.hpp>
+          #include <Eigen/Core>
+
+          int main() {
+            using einsum::literals::operator""_ct;
+            const Eigen::MatrixXd a = Eigen::MatrixXd::Ones(3, 4);
+            const Eigen::MatrixXd b = Eigen::MatrixXd::Ones(4, 2);
+            const auto rt = einsum::einsum("ij,jk->ik");
+            const auto ct = einsum::einsum("ij,jk->ik"_ct);
+            return (*(*rt)(a, b))(0, 0) == 4.0 && (*ct(a, b))(0, 0) == 4.0 ? 0 : 1;
+          }
+          CPP
+          cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/prefix"
+          cmake --build build
+          ./build/consumer
+
+  python:
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build ccache g++-14
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Cache the pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.deps
+          key: ${{ runner.os }}-deps-${{ hashFiles('cmake/EinsumDependencies.cmake') }}
+          restore-keys: ${{ runner.os }}-deps-
+
+      # --no-install-project: the venv gets pybind11, numpy and pytest but not an
+      # installed einsum, so the ctest below imports the build tree.
+      - name: Python environment
+        run: uv sync --group dev --no-install-project
+
+      - name: Configure and build
+        env:
+          CXX: g++-14
+        run: |
+          cmake --preset python
+          cmake --build --preset python
+
+      # Both suites: the Boost.Test binaries and pytest, which python/ registers.
+      - name: Test
+        run: ctest --preset python
+
+      - name: Fail if the committed stub is stale
+        run: |
+          cmake --build --preset python --target einsum_python_stubs
+          git diff --exit-code python/einsum/_einsum.pyi
+
+      # The wheel is the other way this is built, and it is the one that has to
+      # run somewhere else: no -march=native, no libeinsum_rt to find on the
+      # machine.  Imported from outside the checkout so a stray sys.path entry
+      # cannot be what made it work.
+      - name: Install the wheel and import it elsewhere
+        env:
+          CXX: g++-14
+        run: |
+          uv venv --python 3.12 /tmp/wheel
+          VIRTUAL_ENV=/tmp/wheel uv pip install .
+          cd /tmp && /tmp/wheel/bin/python -m pytest -q "$GITHUB_WORKSPACE/python/tests"

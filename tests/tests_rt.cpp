@@ -6,6 +6,7 @@
 #include <unsupported/Eigen/CXX11/Tensor>
 
 #include "einsum/einsum.hpp"
+#include "einsum/rt/dynamic.hpp"
 #include "einsum/rt/parse.hpp"
 
 #include <cmath>
@@ -309,6 +310,227 @@ BOOST_AUTO_TEST_CASE(RtErrors_EveryCode) {
 
   BOOST_CHECK(es::failed_with(es::einsum("abcdefghi"), errc::rank_too_high));
   BOOST_CHECK(es::failed_with(es::einsum("ij,,jk"), errc::empty_operand));
+}
+
+// --- out(x): the rank the operands do not imply -------------------------------
+// The by-value form answers a rank fixed by the operand types, so a subscript
+// whose output is deeper than any operand has nowhere to go.  out() is where
+// that rank is named, and it is the only thing on this path that can name it.
+BOOST_AUTO_TEST_CASE(RtOut_DeeperThanAnyOperand) {
+  const auto plan = es::einsum("ij,kl->ijkl");
+  BOOST_REQUIRE(plan.has_value());
+  const Matrix a = sample(2, 3, 1);
+  const Matrix b = sample(4, 5, 2);
+  const NestFamily left{a};
+  const NestFamily right{b};
+
+  std::vector<std::vector<std::vector<std::vector<double>>>> got;
+  const auto done = (*plan)(left.operand(), right.operand(), es::out(got));
+  BOOST_REQUIRE_MESSAGE(done.has_value(), why(done));
+
+  BOOST_REQUIRE_EQUAL(got.size(), 2U);
+  BOOST_REQUIRE_EQUAL(got[0].size(), 3U);
+  BOOST_REQUIRE_EQUAL(got[0][0].size(), 4U);
+  BOOST_REQUIRE_EQUAL(got[0][0][0].size(), 5U);
+  for (index_t i = 0; i < 2; ++i) {
+    for (index_t j = 0; j < 3; ++j) {
+      for (index_t k = 0; k < 4; ++k) {
+        for (index_t l = 0; l < 5; ++l) {
+          BOOST_CHECK_LT(std::abs(got[static_cast<std::size_t>(i)]
+                                     [static_cast<std::size_t>(j)]
+                                     [static_cast<std::size_t>(k)]
+                                     [static_cast<std::size_t>(l)] -
+                                  a(i, j) * b(k, l)),
+                         1e-12);
+        }
+      }
+    }
+  }
+}
+
+// The same subscript into the view family, whose result owns its storage.
+BOOST_AUTO_TEST_CASE(RtOut_DeeperIntoAnMdarray) {
+  const auto plan = es::einsum("i,j->ij");
+  BOOST_REQUIRE(plan.has_value());
+  const std::vector<double> u{1.0, -2.0, 3.0};
+  const std::vector<double> v{4.0, 5.0};
+  const std::mdspan<const double, std::dextents<std::size_t, 1>> mu{u.data(),
+                                                                   u.size()};
+  const std::mdspan<const double, std::dextents<std::size_t, 1>> mv{v.data(),
+                                                                   v.size()};
+
+  std::experimental::mdarray<double, std::dextents<std::size_t, 2>> got;
+  const auto done = (*plan)(mu, mv, es::out(got));
+  BOOST_REQUIRE_MESSAGE(done.has_value(), why(done));
+  BOOST_REQUIRE_EQUAL(got.extent(0), 3U);
+  BOOST_REQUIRE_EQUAL(got.extent(1), 2U);
+  for (std::size_t i = 0; i < 3; ++i) {
+    for (std::size_t j = 0; j < 2; ++j) {
+      BOOST_CHECK_LT(std::abs(got[i, j] - u[i] * v[j]), 1e-12);
+    }
+  }
+}
+
+// out() is a tag and nothing more: an untagged trailing argument is an operand
+// however it was declared, so the ordinary call is unaffected by any of this.
+BOOST_AUTO_TEST_CASE(RtOut_TagIsTheOnlyDisambiguator) {
+  const auto plan = es::einsum("ij,jk->ik");
+  BOOST_REQUIRE(plan.has_value());
+  Matrix a = sample(4, 5, 1); // mutable, and still an operand
+  Matrix b = sample(5, 3, 2);
+
+  const auto by_value = (*plan)(a, b);
+  BOOST_REQUIRE_MESSAGE(by_value.has_value(), why(by_value));
+
+  Matrix into;
+  const auto done = (*plan)(a, b, es::out(into));
+  BOOST_REQUIRE_MESSAGE(done.has_value(), why(done));
+  BOOST_CHECK_LT((into - *by_value).cwiseAbs().maxCoeff(), 1e-12);
+  BOOST_CHECK_LT((into - a * b).cwiseAbs().maxCoeff(), 1e-12);
+
+  // The tag does not excuse the count: out() is one past the operands the
+  // subscript names, and one fewer than that is still a mismatch.
+  Matrix other;
+  BOOST_CHECK(es::failed_with((*plan)(a, es::out(other)),
+                              errc::operand_count_mismatch));
+}
+
+// --- the entry whose arity and ranks are values ------------------------------
+// What a language binding calls: layouts and pointers rather than operands, so
+// nothing about the call is in a type but the scalar.  Cross-checked against
+// operator() on the same subscript, because two ways to run one contraction
+// that disagree are worse than one way.
+namespace {
+
+// Run `subscript` over `ops`, and hand back what it wrote and the shape it
+// chose.  The output is allocated at the rank the lowering asks for, which is
+// the whole reason this entry exists.
+struct Dynamic {
+  std::vector<double> values;
+  es::Shape shape;
+};
+
+[[nodiscard]] es::result<Dynamic>
+run_dynamic(const es::Einsum &plan,
+            const std::span<const es::impl::TensorView<const double>> ops) {
+  Dynamic got;
+  const auto done = es::impl::evaluate_dynamic<double>(
+      plan, ops, [&got](const es::Shape &shape) {
+        got.shape = shape;
+        got.values.assign(
+            static_cast<std::size_t>(es::impl::product(shape)), 0.0);
+        return got.values.data();
+      });
+  if (!done) {
+    return es::propagate<Dynamic>(done.error());
+  }
+  return got;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(RtDynamic_MatchesTheTypedCall) {
+  const auto plan = es::einsum("ij,jk->ik");
+  BOOST_REQUIRE(plan.has_value());
+  const Matrix a = sample(3, 4, 1);
+  const Matrix b = sample(4, 2, 5);
+
+  // Row-major copies, described the way a C-ordered array describes itself.
+  const MdspanFamily left{a};
+  const MdspanFamily right{b};
+  const es::impl::TensorView<const double> ops[]{
+      {left.buffer.data(), {.shape = {3, 4}, .strides = {4, 1}}},
+      {right.buffer.data(), {.shape = {4, 2}, .strides = {2, 1}}}};
+
+  const auto got = run_dynamic(*plan, ops);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
+  BOOST_REQUIRE_EQUAL(got->shape.size(), 2U);
+  const Matrix want = a * b;
+  for (index_t i = 0; i < 3; ++i) {
+    for (index_t k = 0; k < 2; ++k) {
+      BOOST_CHECK_LT(std::abs(got->values[static_cast<std::size_t>(i * 2 + k)] -
+                              want(i, k)),
+                     1e-12);
+    }
+  }
+}
+
+// A Layout is extents and signed strides and nothing about who owns the memory,
+// so a column-major operand and a reversed one are the same call with different
+// numbers in it.  Both are shapes a NumPy array arrives in.
+BOOST_AUTO_TEST_CASE(RtDynamic_ColumnMajorAndReversedStrides) {
+  const auto plan = es::einsum("ij,jk->ik");
+  BOOST_REQUIRE(plan.has_value());
+  const Matrix a = sample(3, 4, 2); // Eigen is column-major by default
+  const Matrix b = sample(4, 2, 7);
+
+  // a as it actually lies: stride 1 down a column, rows() across.
+  const es::impl::TensorView<const double> column_major[]{
+      {a.data(), {.shape = {3, 4}, .strides = {1, 3}}},
+      {b.data(), {.shape = {4, 2}, .strides = {1, 4}}}};
+  const auto straight = run_dynamic(*plan, column_major);
+  BOOST_REQUIRE_MESSAGE(straight.has_value(), why(straight));
+
+  // The same a, read up its columns instead of down: base at the last element
+  // of each column and a stride of -1, which is a[::-1] in every axis.
+  const Matrix flipped = a.colwise().reverse();
+  const es::impl::TensorView<const double> reversed[]{
+      {a.data() + 2, {.shape = {3, 4}, .strides = {-1, 3}}},
+      {b.data(), {.shape = {4, 2}, .strides = {1, 4}}}};
+  const auto backwards = run_dynamic(*plan, reversed);
+  BOOST_REQUIRE_MESSAGE(backwards.has_value(), why(backwards));
+
+  const Matrix want = a * b;
+  const Matrix want_flipped = flipped * b;
+  for (index_t i = 0; i < 3; ++i) {
+    for (index_t k = 0; k < 2; ++k) {
+      const auto at = static_cast<std::size_t>(i * 2 + k);
+      BOOST_CHECK_LT(std::abs(straight->values[at] - want(i, k)), 1e-12);
+      BOOST_CHECK_LT(std::abs(backwards->values[at] - want_flipped(i, k)), 1e-12);
+    }
+  }
+}
+
+// The rank no operand implies.  The typed call answers rank_mismatch for this
+// subscript unless an output names the rank; here the lowering names it, and
+// the buffer is allocated to fit.
+BOOST_AUTO_TEST_CASE(RtDynamic_OutputDeeperThanEveryOperand) {
+  const auto plan = es::einsum("i,j->ij");
+  BOOST_REQUIRE(plan.has_value());
+  const std::vector<double> u{1.0, -2.0, 3.0};
+  const std::vector<double> v{4.0, 5.0};
+  const es::impl::TensorView<const double> ops[]{
+      {u.data(), {.shape = {3}, .strides = {1}}},
+      {v.data(), {.shape = {2}, .strides = {1}}}};
+
+  const auto got = run_dynamic(*plan, ops);
+  BOOST_REQUIRE_MESSAGE(got.has_value(), why(got));
+  BOOST_REQUIRE_EQUAL(got->shape.size(), 2U);
+  BOOST_CHECK_EQUAL(got->shape[0], 3);
+  BOOST_CHECK_EQUAL(got->shape[1], 2);
+  for (std::size_t i = 0; i < 3; ++i) {
+    for (std::size_t j = 0; j < 2; ++j) {
+      BOOST_CHECK_LT(std::abs(got->values[i * 2 + j] - u[i] * v[j]), 1e-12);
+    }
+  }
+}
+
+// The same refusals the typed call gives, since it is the same lowering.
+BOOST_AUTO_TEST_CASE(RtDynamic_Errors) {
+  const auto plan = es::einsum("ij,jk->ik");
+  BOOST_REQUIRE(plan.has_value());
+  const Matrix a = sample(3, 4, 1);
+
+  const es::impl::TensorView<const double> one[]{
+      {a.data(), {.shape = {3, 4}, .strides = {1, 3}}}};
+  BOOST_CHECK(es::failed_with(run_dynamic(*plan, one),
+                              errc::operand_count_mismatch));
+
+  const es::impl::TensorView<const double> conflicting[]{
+      {a.data(), {.shape = {3, 4}, .strides = {1, 3}}},
+      {a.data(), {.shape = {5, 2}, .strides = {1, 5}}}};
+  BOOST_CHECK(
+      es::failed_with(run_dynamic(*plan, conflicting), errc::extent_conflict));
 }
 
 // --- the lowerings that are not one GEMM -------------------------------------

@@ -571,3 +571,23 @@ build/
 /build_release/*
 # Pinned third-party sources, unpacked by cmake/EinsumDependencies.cmake
 /.deps/
+
+# --- this project -------------------------------------------------------------
+# The Python side.  __pycache__/ and .venv are covered above; these are the tool
+# caches and the build outputs that scikit-build-core, cibuildwheel and the test
+# runners leave in the tree.
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+wheelhouse/
+_skbuild/
+
+# Written by CMake into the package in the *build* tree, never into python/ --
+# but a stray in-source configure would put them here, and they are artifacts.
+/python/einsum/*.so
+/python/einsum/*.pyd
+
+# Per-machine, not per-project.
+.claude/settings.local.json

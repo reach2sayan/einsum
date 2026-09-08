@@ -163,6 +163,29 @@ template <typename... A> [[nodiscard]] consteval bool is_out_form() noexcept {
       std::make_index_sequence<sizeof...(A) - 1>{});
 }
 
+// The same question on the runtime path, where the operand count is not a
+// constant and so cannot answer it.  Constness cannot answer it either: the
+// ordinary `e(a, b)` over two mutable locals is exactly the shape a
+// two-operands-and-an-output call has, and reading one as the other would tax
+// every call site to spell what it already meant.
+//
+// So the output says so.  einsum::out(x) is the whole disambiguator, it is
+// checked here as a type, and an untagged trailing argument is an operand
+// however it was declared.
+template <typename X> inline constexpr bool is_out_tag_v = false;
+
+template <typename... A>
+[[nodiscard]] consteval bool is_rt_out_form() noexcept {
+  if constexpr (sizeof...(A) < 2) {
+    // One argument is an operand: a subscript naming none does not parse, so
+    // there is nothing an output could be the output of.
+    return false;
+  } else {
+    return is_out_tag_v<std::remove_cvref_t<
+        std::tuple_element_t<sizeof...(A) - 1, std::tuple<A...>>>>;
+  }
+}
+
 // --- the one contraction -----------------------------------------------------
 // What both entry points do once the lowering is known.  They differ only in
 // where the block of scratch comes from -- a pooled allocation on the runtime
@@ -244,6 +267,27 @@ void contract_into(const Plan &plan, const Geometry &geometry,
 
 } // namespace impl
 
+// --- naming an output --------------------------------------------------------
+// out(x) marks the last argument of a call as where the result goes rather than
+// as one more operand.  That is the only way the runtime path can be told,
+// since the operand count is a value there and not a constant -- and it is what
+// lets a call reach a rank no operand implies: "ij,kl->ijkl" writes rank 4 from
+// two rank-2 operands, and x's own type is where that 4 is written down.
+//
+// A reference, deliberately: it exists for the length of one call and names
+// storage the caller already has, so it binds lvalues only.
+template <COperand R> struct Out {
+  R &target;
+};
+
+template <COperand R> [[nodiscard]] constexpr Out<R> out(R &target) noexcept {
+  return {target};
+}
+
+namespace impl {
+template <typename R> inline constexpr bool is_out_tag_v<Out<R>> = true;
+} // namespace impl
+
 // --- the object
 // --------------------------------------------------------------- A parsed
 // subscript and nothing else a caller can see.  Both call operators are const:
@@ -285,18 +329,28 @@ public:
     return plan_.output_labels();
   }
 
-  // obj(a, b, ...): the result, by value, in the operands' own family.
+  // obj(a, b, ...)           -> result<R>, by value, in the operands' own family
+  // obj(a, b, ..., out(x))   -> result<void>, moved into x
   //
-  // There is no output-parameter form here, and deliberately: the operand count
-  // is a run-time value on this path, so a trailing non-const matrix could not
-  // be told from one more operand, and `out = *e(a, b)` is already a move for
-  // every family this returns.
-  template <COperand... Ops>
-    requires CSameFamily<Ops...>
-  [[nodiscard]] result<result_of_t<Ops...>>
-  operator()(const Ops &...ops) const {
-    return evaluate<result_of_t<Ops...>, scalar_of_t<impl::first_of_t<Ops...>>>(
-        ops...);
+  // Which one a call is is settled by the tag and by nothing else, so an
+  // operand needs no ceremony to stay one.
+  template <typename... A> [[nodiscard]] auto operator()(A &&...args) const {
+    if constexpr (impl::is_rt_out_form<A...>()) {
+      return untag_output(std::forward_as_tuple(EINSUM_FWD(args)...),
+                          std::make_index_sequence<sizeof...(A) - 1>{});
+    } else {
+      static_assert(CSameFamily<A...>,
+                    "einsum(...): one call's operands must be one family and "
+                    "one scalar -- all Eigen objects, all mdspans or spans, or "
+                    "all nested ranges; their ranks may differ.  A trailing "
+                    "non-const operand is read as an output, so pass operands "
+                    "as const");
+      if constexpr (!CSameFamily<A...>) {
+        return result<void>{};
+      } else {
+        return by_value(args...);
+      }
+    }
   }
 
 protected:
@@ -304,6 +358,29 @@ protected:
   constexpr BasicEinsum(Plan plan, const path order) noexcept
       : plan_{std::move(plan)}, order_{order} {}
   friend struct impl::einsum_access;
+
+  // Drop the tag and hand the storage it named to with_output, which wants the
+  // output itself in the last slot.  Both objects come through here, so out()
+  // means the same thing on either path.
+  template <impl::CTupleLike Tup, std::size_t... I>
+  result<void> untag_output(Tup tup, std::index_sequence<I...>) const {
+    return with_output(std::forward_as_tuple(
+                           std::get<I>(tup)...,
+                           std::get<sizeof...(I)>(tup).target),
+                       std::index_sequence<I...>{});
+  }
+
+  // The by-value form, deduced from bare types rather than from the forwarding
+  // references above: result_of_t is written in terms of operand types, and a
+  // deduced `T&` is not one.  The compile-time object calls this directly --
+  // there the arity is a constant and has already settled the question, so it
+  // must not be asked again.
+  template <COperand... Ops>
+    requires CSameFamily<Ops...>
+  [[nodiscard]] result<result_of_t<Ops...>> by_value(const Ops &...ops) const {
+    return evaluate<result_of_t<Ops...>, scalar_of_t<impl::first_of_t<Ops...>>>(
+        ops...);
+  }
 
   // Used by the compile-time object, where arity settles which form a call is.
   // R is the output's own type, not result_of_t of the operands: that is what
@@ -447,6 +524,20 @@ struct einsum_access {
   template <CScratch Scratch>
   [[nodiscard]] static const Path &last_path(const BasicEinsum<Scratch> &e) noexcept {
     return e.lowering_.geometry.path;
+  }
+
+  // What the runtime-rank entry point in <einsum/rt/dynamic.hpp> needs and a
+  // caller has no business seeing: the lowering cache it shares with the typed
+  // call operator, and the scratch block both draw from.
+  template <CScratch Scratch>
+  [[nodiscard]] static LastLowering &
+  lowering_of(const BasicEinsum<Scratch> &e) noexcept {
+    return e.lowering_;
+  }
+  template <CScratch Scratch>
+  [[nodiscard]] static const Scratch &
+  scratch_of(const BasicEinsum<Scratch> &e) noexcept {
+    return e.scratch_;
   }
 
   // The compile-time counterpart: the path a StaticEinsum would choose for

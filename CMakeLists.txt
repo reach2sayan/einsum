@@ -32,7 +32,7 @@ include(EinsumDependencies)
 
 option(EINSUM_BUILD_TESTS "Build the Boost.Test suites" ON)
 option(EINSUM_BUILD_BENCHMARKS "Build the Google Benchmark suite" ON)
-option(EINSUM_BUILD_SHARED_RT "Build libeinsum_rt as a shared library" OFF)
+option(EINSUM_BUILD_PYTHON "Build the pybind11 extension module" OFF)
 
 # --- the header-only library -------------------------------------------------
 einsum_use_boost()
@@ -42,39 +42,37 @@ einsum_use_mdspan()
 add_library(einsum INTERFACE)
 add_library(einsum::einsum ALIAS einsum)
 
+# Every header under include/, found rather than listed: the list drifted once
+# already -- core/kind.hpp was written, not added, and only an install noticed.
+file(GLOB_RECURSE EINSUM_HEADERS CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/include/einsum/*.hpp")
 target_sources(einsum INTERFACE
         FILE_SET HEADERS
         BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/include
-        FILES
-        include/einsum/einsum.hpp
-        include/einsum/util/concepts.hpp
-        include/einsum/util/error.hpp
-        include/einsum/util/export.hpp
-        include/einsum/util/fixed_string.hpp
-        include/einsum/util/fixed_vec.hpp
-        include/einsum/util/ranges.hpp
-        include/einsum/core/einsum_object.hpp
-        include/einsum/core/execute.hpp
-        include/einsum/core/kernels.hpp
-        include/einsum/core/limits.hpp
-        include/einsum/core/lower.hpp
-        include/einsum/core/owned.hpp
-        include/einsum/core/path.hpp
-        include/einsum/core/plan.hpp
-        include/einsum/core/view.hpp
-        include/einsum/ct/einsum.hpp
-        include/einsum/ct/static_shape.hpp
-        include/einsum/ct/subscripts.hpp
-        include/einsum/rt/parse.hpp)
+        FILES ${EINSUM_HEADERS})
 
 target_include_directories(einsum INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>)
-target_link_libraries(einsum INTERFACE Boost::headers Eigen3::Eigen mdspan::mdspan)
+# BUILD_INTERFACE only: an installed einsum carries Boost, Eigen and mdspan in
+# its own include directory (cmake/EinsumInstall.cmake), so the one path above
+# is all three and the exported target names no package a consumer must find.
+target_link_libraries(einsum INTERFACE
+        $<BUILD_INTERFACE:Boost::headers>
+        $<BUILD_INTERFACE:Eigen3::Eigen>
+        $<BUILD_INTERFACE:mdspan::mdspan>)
+# The one thing those targets carry that is not an include path.
+target_compile_definitions(einsum INTERFACE $<INSTALL_INTERFACE:EIGEN_MPL2_ONLY>)
 target_compile_features(einsum INTERFACE cxx_std_23)
 
 # --- libeinsum_rt ------------------------------------------------------------
 add_subdirectory(src/rt)
+
+option(EINSUM_INSTALL "Generate the install rules and the CMake package"
+        ${PROJECT_IS_TOP_LEVEL})
+if (EINSUM_INSTALL)
+    include(EinsumInstall)
+endif ()
 
 # A consumer that add_subdirectory()s us gets the library and nothing else.
 if (NOT PROJECT_IS_TOP_LEVEL)
@@ -94,4 +92,11 @@ endif ()
 
 if (EINSUM_BUILD_BENCHMARKS)
     add_subdirectory(benchmark)
+endif ()
+
+# After enable_testing(): python/ registers the pytest suite with it, so `ctest`
+# stays the one verb for "run the tests".
+if (EINSUM_BUILD_PYTHON)
+    einsum_use_pybind11()
+    add_subdirectory(python)
 endif ()

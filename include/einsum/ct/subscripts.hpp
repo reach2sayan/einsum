@@ -123,8 +123,9 @@ finish_subscripts(Subscripts subs) noexcept {
     // NumPy's rule: the broadcast axes come first, then the labels seen exactly
     // once.  The count is not known until the operands arrive, so the output
     // records only that they lead.
-    if (std::ranges::any_of(subs.ellipsis_at,
-                            [](const std::uint8_t at) { return at != kNoEllipsis; })) {
+    if (std::ranges::any_of(subs.ellipsis_at, [](const std::uint8_t at) {
+          return at != kNoEllipsis;
+        })) {
       subs.output_ellipsis_at = 0;
     }
     return subs;
@@ -188,7 +189,8 @@ parse_subscripts(const std::string_view source) noexcept {
     if (c == '.') {
       // Exactly three, and at most one per term.  Anything else is a typo, not
       // a shorthand.
-      if (i + 2 >= source.size() || source[i + 1] != '.' || source[i + 2] != '.') {
+      if (i + 2 >= source.size() || source[i + 1] != '.' ||
+          source[i + 2] != '.') {
         return fail(errc::bad_syntax);
       }
       i += 2;
@@ -196,7 +198,8 @@ parse_subscripts(const std::string_view source) noexcept {
       if (at != kNoEllipsis) {
         return fail(errc::ellipsis_repeated);
       }
-      at = static_cast<std::uint8_t>(in_output ? subs.output.size() : current.size());
+      at = static_cast<std::uint8_t>(in_output ? subs.output.size()
+                                               : current.size());
       continue;
     }
     if (!is_label(c)) {
@@ -219,14 +222,16 @@ parse_subscripts(const std::string_view source) noexcept {
   return finish_subscripts(subs);
 }
 
-// --- expanding '...' ----------------------------------------------------------
-// Every '...' becomes as many synthetic labels as the operand ranks say it
-// stands for, after which nothing downstream knows an ellipsis was ever there.
-// The dimensions are right-aligned across operands, as NumPy aligns them: an
+// --- expanding '...'
+// ---------------------------------------------------------- Every '...'
+// becomes as many synthetic labels as the operand ranks say it stands for,
+// after which nothing downstream knows an ellipsis was ever there. The
+// dimensions are right-aligned across operands, as NumPy aligns them: an
 // operand covering fewer of them takes the LAST of the broadcast labels, so a
 // (3, 4) and a (5, 3, 4) meet on their trailing axes.
 [[nodiscard]] constexpr result<Subscripts>
-expand(const Subscripts &subs, const std::span<const std::uint8_t> ranks) noexcept {
+expand(const Subscripts &subs,
+       const std::span<const std::uint8_t> ranks) noexcept {
   if (ranks.size() != subs.operands.size()) {
     return fail(errc::operand_count_mismatch);
   }

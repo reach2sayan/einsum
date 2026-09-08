@@ -23,6 +23,6 @@ parse_subscript(std::string_view source) noexcept;
 // einsum("ij,jk->ik") -- the runtime half of the entry point; the compile-time
 // half is the einsum<"..."> overload in ct/einsum.hpp.
 [[nodiscard]] EINSUM_API result<Einsum> einsum(std::string_view source,
-                                              path order = path::greedy);
+                                               path order = path::greedy);
 
 } // namespace einsum

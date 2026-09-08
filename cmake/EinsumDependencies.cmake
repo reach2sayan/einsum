@@ -77,11 +77,13 @@ macro(einsum_use_boost)
     if (NOT TARGET Boost::headers)
         if (EINSUM_BOOST_INCLUDEDIR)
             _einsum_adopt_header_dep(Boost::headers "${EINSUM_BOOST_INCLUDEDIR}" "boost/version.hpp"
-                    EINSUM_BOOST_INCLUDEDIR "Boost ${EINSUM_BOOST_VERSION}")
+                    EINSUM_BOOST_INCLUDEDIR "Boost ${EINSUM_BOOST_VERSION}"
+                    EINSUM_BOOST_ROOT)
         else ()
             FetchContent_MakeAvailable(boost)
             _einsum_adopt_header_dep(Boost::headers "${boost_SOURCE_DIR}" "boost/version.hpp"
-                    EINSUM_BOOST_INCLUDEDIR "Boost ${EINSUM_BOOST_VERSION}")
+                    EINSUM_BOOST_INCLUDEDIR "Boost ${EINSUM_BOOST_VERSION}"
+                    EINSUM_BOOST_ROOT)
         endif ()
     endif ()
 endmacro()
@@ -93,11 +95,13 @@ macro(einsum_use_eigen)
     if (NOT TARGET Eigen3::Eigen)
         if (EINSUM_EIGEN_INCLUDEDIR)
             _einsum_adopt_header_dep(Eigen3::Eigen "${EINSUM_EIGEN_INCLUDEDIR}" "Eigen/Core"
-                    EINSUM_EIGEN_INCLUDEDIR "Eigen ${EINSUM_EIGEN_VERSION}")
+                    EINSUM_EIGEN_INCLUDEDIR "Eigen ${EINSUM_EIGEN_VERSION}"
+                    EINSUM_EIGEN_ROOT)
         else ()
             FetchContent_MakeAvailable(eigen)
             _einsum_adopt_header_dep(Eigen3::Eigen "${eigen_SOURCE_DIR}" "Eigen/Core"
-                    EINSUM_EIGEN_INCLUDEDIR "Eigen ${EINSUM_EIGEN_VERSION}")
+                    EINSUM_EIGEN_INCLUDEDIR "Eigen ${EINSUM_EIGEN_VERSION}"
+                    EINSUM_EIGEN_ROOT)
         endif ()
         set_property(TARGET Eigen3::Eigen APPEND PROPERTY
                 INTERFACE_COMPILE_DEFINITIONS EIGEN_MPL2_ONLY)
@@ -114,6 +118,36 @@ macro(einsum_use_mdspan)
         set(MDSPAN_ENABLE_BENCHMARKS OFF CACHE BOOL "" FORCE)
         set(MDSPAN_ENABLE_COMP_EXT_TESTS OFF CACHE BOOL "" FORCE)
         FetchContent_MakeAvailable(mdspan)
+        # Its own CMake defines the target; only the include root has to be
+        # written down, for the vendoring step.
+        set(EINSUM_MDSPAN_ROOT "${mdspan_SOURCE_DIR}/include"
+                CACHE INTERNAL "Include root of kokkos/mdspan")
+    endif ()
+endmacro()
+
+# --- pybind11 ----------------------------------------------------------------
+# The interpreter's own pybind11, never the machine's.  This is the one
+# dependency that must match the environment rather than a pin: the extension it
+# builds is loaded by that interpreter and by no other.  3.0 is where
+# native_enum arrived, which is what makes errc a real enum.IntEnum in Python.
+macro(einsum_use_pybind11)
+    if (NOT TARGET pybind11::module)
+        find_package(Python 3.11 REQUIRED COMPONENTS Interpreter Development.Module)
+        if (NOT DEFINED pybind11_DIR)
+            execute_process(
+                    COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
+                    OUTPUT_VARIABLE pybind11_DIR
+                    OUTPUT_STRIP_TRAILING_WHITESPACE
+                    ERROR_QUIET)
+            if (NOT pybind11_DIR)
+                message(FATAL_ERROR
+                        "${Python_EXECUTABLE} has no pybind11.  Install it there -- "
+                        "`uv sync`, or `pip install 'pybind11>=3'`.  Left to search the "
+                        "machine, CMake finds whatever the distribution packaged, which "
+                        "is how a 2.x turns up against a 3.0 request.")
+            endif ()
+        endif ()
+        find_package(pybind11 3.0 CONFIG REQUIRED)
     endif ()
 endmacro()
 
@@ -132,7 +166,9 @@ endmacro()
 # --- helpers -----------------------------------------------------------------
 # One IMPORTED GLOBAL INTERFACE target per header-only root.  SYSTEM, so
 # -Wconversion and friends never fire inside somebody else's headers.
-macro(_einsum_adopt_header_dep target root witness override_var label)
+# `root_var` is where the include root is recorded for EinsumInstall.cmake, which
+# vendors the subset of it that our headers reach.
+macro(_einsum_adopt_header_dep target root witness override_var label root_var)
     if (NOT EXISTS "${root}/${witness}")
         message(FATAL_ERROR
                 "No ${label} at ${root}: it has no ${witness}.  ${override_var} must name "
@@ -143,6 +179,7 @@ macro(_einsum_adopt_header_dep target root witness override_var label)
     set_target_properties(${target} PROPERTIES
             INTERFACE_INCLUDE_DIRECTORIES "${root}"
             INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${root}")
+    set(${root_var} "${root}" CACHE INTERNAL "Include root of ${label}")
     message(STATUS "${label} (${root})")
 endmacro()
 

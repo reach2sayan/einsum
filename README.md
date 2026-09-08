@@ -5,10 +5,11 @@ by value in the operands' own family.
 
 ```cpp
 #include <einsum/einsum.hpp>
+using einsum::literals::operator""_ct;
 
-// The subscript is a template argument, so a bad one is a static_assert
+// The subscript reaches a template parameter, so a bad one is a static_assert
 // carrying the sentence -- not a template backtrace.
-const auto matmul = einsum::einsum<"ij,jk->ik">();
+const auto matmul = einsum::einsum("ij,jk->ik"_ct);
 const auto c = matmul(a, b);                  // result<...>, by value
 ```
 
@@ -79,9 +80,10 @@ cmake --preset release && cmake --build --preset release && ctest --preset relea
 | `debug` | unoptimised, assertions live |
 | `release` | `-O3 -march=native` |
 | `asan` | Debug + AddressSanitizer, everything instrumented including Boost.Test |
+| `python` | Release + the extension module, built against `.venv` |
 
-Three, because everything else is one variable on top of one of them rather than
-a preset of its own:
+Four, because everything else is one variable on top of one of them rather
+than a preset of its own:
 
 ```
 CXX=clang++-20 cmake --preset release          # the Clang 20 build
@@ -89,9 +91,9 @@ cmake --preset release -DEINSUM_TRACE=ON       # -ftime-trace / -ftime-report
 cmake --preset asan -DEINSUM_SANITIZE=thread   # or undefined
 ```
 
-Options: `EINSUM_BUILD_TESTS`, `EINSUM_BUILD_BENCHMARKS`, `EINSUM_BUILD_SHARED_RT`,
-`EINSUM_NATIVE_ARCH`, `EINSUM_SANITIZE` (`off`/`address`/`undefined`/`thread`),
-`EINSUM_TRACE`.
+Options: `EINSUM_BUILD_TESTS`, `EINSUM_BUILD_BENCHMARKS`, `EINSUM_BUILD_PYTHON`,
+`EINSUM_INSTALL`, `EINSUM_NATIVE_ARCH`, `EINSUM_SANITIZE`
+(`off`/`address`/`undefined`/`thread`), `EINSUM_TRACE`.
 
 Everything is built `-fno-exceptions` except two targets that cannot be: the one
 object holding the Boost.Parser grammar, and the Boost.Test executables. Nothing
@@ -146,17 +148,19 @@ A runtime call also caches the lowering it produced, keyed on the operands' shap
 
 A subscript whose output is *deeper* than any operand — `"i,j->ij"` from two
 vectors, `"ij,kl->ijkl"` from two matrices — therefore cannot be returned by
-value at all, because no operand type implies that rank. On the compile-time
-path, name the result instead and its own type sets the rank:
+value at all, because no operand type implies that rank. Name the result
+instead, and its own type sets the rank:
 
 ```cpp
 std::vector<std::vector<std::vector<std::vector<int>>>> out;
-einsum<"ij,kl->ijkl">()(a, b, out);          // the output form fixes the rank
+einsum<"ij,kl->ijkl">()(a, b, out);           // compile time: one more argument
+(*einsum("ij,kl->ijkl"))(a, b, einsum::out(out));   // run time: the tag says so
 ```
 
-On the runtime path that form does not exist (see below), so a deeper output is
-`rank_mismatch` and nothing more — use the compile-time spelling for those
-subscripts.
+Both paths reach it. The compile-time one can count — the operand count is in
+the subscript's type — so one argument past that is unambiguously an output. The
+runtime one cannot, so the output says so itself: `einsum::out(x)` is a tag, and
+an untagged trailing argument is an operand however it was declared.
 
 The compile-time form could in principle return exact types for the cases it
 *can* express, since it has the subscript as a template argument; it
@@ -168,22 +172,33 @@ between the two does not change what it answers.
 There is one object and one call operator.
 
 ```cpp
-const auto e = einsum::einsum<"ij,jk->ik">();   // compile time: checked here
+const auto e = einsum::einsum("ij,jk->ik"_ct);  // compile time: checked here
 const auto p = einsum::einsum("ij,jk->ik");     // run time: result<Einsum>
 
 const auto c = e(a, b);                         // result<R>, by value
 out = *e(a, b);                                 // "in place" is just a move
+(*p)(a, b, einsum::out(out));                   // or write into it directly
 ```
 
 - **`operator()(ops...)`** converts the operands, infers the output shape,
   lowers, allocates the result, executes, and returns it. It is `const`, the
   object is immutable, and there is no caching of anything observable.
-- **`operator()(ops..., out)`** exists only on the compile-time form, where the
-  operand count is a constant so one extra argument is unambiguously an output.
-  The runtime form has no such luxury — a trailing non-const matrix could not be
-  told from one more operand — so use the move above.
+- **`operator()(ops..., out)`** writes into `out` and answers `result<void>`;
+  `out`'s own type fixes the result's rank, which is the only way to reach one
+  the operands do not imply. On the compile-time form the trailing argument may
+  be the output itself, since the operand count is a constant there. On the
+  runtime form it must be `einsum::out(x)` — the count is a value, so nothing
+  else could tell an output from one more operand.
+- **`einsum::out(x)`** is accepted by both forms, so a call moves between the
+  two paths without being rewritten.
 - **`subscripts()`**, **`operand_count()`**, **`output_labels()`** are the only
   queries.
+- **`"..."_ct`** is how the compile-time path takes a string. A function
+  argument is never a constant expression, so the subscript has to reach a
+  template parameter, and a literal operator template is the only thing that
+  puts it there while still reading as a call. `einsum<"ij,jk->ik">()` is what
+  the suffix expands to and remains spellable; the contraction order goes with
+  it, as `"ab,bc,cd->ad"_ct.with<path::sequential>()`.
 
 Copies of an object are independent. Concurrent calls on *one* object need
 external synchronisation, because they share its scratch cache — a `mutable`
@@ -241,6 +256,7 @@ blocking buffers live on the stack below `EIGEN_STACK_ALLOCATION_LIMIT`
 | diagonals, traces, partial traces | yes |
 | `...` at any position, right-aligned | yes |
 | size-1 broadcasting | yes |
+| outputs deeper than any operand (`"i,j->ij"`) | yes, through `out(x)` |
 | contraction path | greedy by default, `path::sequential` available |
 | sublist form `einsum(op, [0,1], ...)` | no |
 | `dtype` / `casting` / `order` arguments | no |
@@ -310,16 +326,75 @@ access to an operand whose inner stride it cannot see is 1 at compile time, and
 evaluates it into a heap temporary instead. Everything about the map-or-pack
 decision exists to keep that from happening.
 
-## The single header
+## Python
 
 ```
-python3 scripts/amalgamate.py     # -> single_include/einsum.hpp
+pip install einsum-cpp
 ```
 
-Covers the header-only library: `einsum<"...">`, the object it answers, the views, the
-lowering and the kernels. It still needs Boost, Eigen and mdspan on the include
-path. It does **not** cover `einsum(std::string_view)` — that grammar is compiled into
-`libeinsum_rt`, and a single header cannot carry a translation unit.
+```python
+import numpy as np, einsum
+
+a, b = np.ones((3, 4)), np.ones((4, 2))
+einsum.contract("ij,jk->ik", a, b)            # np.einsum's spelling
+matmul = einsum.einsum("ij,jk->ik")           # or keep the object
+matmul(a, b)
+```
+
+The runtime path only -- the compile-time one is a template and cannot cross.
+`Einsum.subscripts`, `.operand_count`, `.output_labels`, and `Path.GREEDY` /
+`Path.SEQUENTIAL` are the rest of it; every refusal is an `einsum.Error` whose
+`.code` is the same `errc` the C++ returns, with the same sentence.
+
+Operands are float64 or float32 -- float32 throughout is a float32 call and
+anything else is converted, which is what NumPy's own promotion would have done.
+An array is read where it lies whatever its strides, so C- or F-ordered, sliced,
+transposed and reversed arrays are all zero-copy; only a broadcast view is
+materialised, because a repeated element is not a strided rectangle.
+
+The result comes back at the rank the *subscript* implies rather than the
+operands', so `"i,j->ij"` and `"ij,kl->ijkl"` are arrays here and need no `out`.
+That is the one thing the bindings do that the typed C++ call cannot: they
+allocate the output themselves, so the lowering's own shape is the answer.
+
+A call holds the GIL for its whole length, deliberately: it grows the object's
+scratch and rewrites its lowering cache, so serialising on the GIL is what makes
+sharing one object between threads safe. A copy starts cold, so a caller wanting
+real parallelism copies.
+
+```
+cmake --preset python && ctest --preset python   # both suites, C++ and pytest
+cmake --build --preset python --target einsum_python_stubs
+```
+
+## Installing
+
+```
+cmake --install build/release --prefix /somewhere
+```
+
+```cmake
+find_package(einsum REQUIRED)
+target_link_libraries(app PRIVATE einsum::einsum einsum::rt)
+```
+
+One prefix and no other package. Boost, Eigen and mdspan are installed into the
+same include directory as `einsum/`, because all three are fetched against a pin
+here and none is one a machine reliably has -- a distribution's Boost predates
+Boost.Parser, and no libstdc++ on the floor ships `<mdspan>`. What ships is the
+part of each our own headers reach, worked out by asking the compiler for the
+include closure:
+
+```
+python3 scripts/vendor_headers.py            # rewrite cmake/EinsumVendoredHeaders.cmake
+python3 scripts/vendor_headers.py --check    # what CI runs
+```
+
+Point `EINSUM_BOOST_INCLUDEDIR` or `EINSUM_EIGEN_INCLUDEDIR` at your own copy
+and that one is neither fetched nor vendored -- you asked for it, you have it.
+
+`einsum::rt` is a shared library: `libeinsum_rt.so`, one translation unit and
+two exported symbols, holding the runtime grammar.
 
 ## Benchmarks
 

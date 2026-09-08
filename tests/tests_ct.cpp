@@ -72,6 +72,33 @@ template <std::size_t... E, typename T>
 
 } // namespace
 
+// --- "..."_ct: the subscript as an argument -----------------------------------
+// A function argument is never a constant expression, so the suffix is what
+// puts the subscript in the template parameter it has to reach.  What comes
+// back is the same object the angle-bracket spelling answers -- asserted here,
+// because two spellings of one thing that differ are worse than one spelling.
+BOOST_AUTO_TEST_CASE(EinsumCt_LiteralSuffixIsTheSameObject) {
+  using einsum::literals::operator""_ct;
+
+  const auto suffixed = es::einsum("ij,jk->ik"_ct);
+  const auto angled = es::einsum<"ij,jk->ik">();
+  static_assert(std::same_as<decltype(suffixed), decltype(angled)>);
+
+  const auto ordered = es::einsum("ab,bc,cd->ad"_ct.with<es::path::sequential>());
+  static_assert(std::same_as<decltype(ordered),
+                             const decltype(es::einsum<"ab,bc,cd->ad",
+                                                       es::path::sequential>())>);
+  BOOST_CHECK_EQUAL(ordered.operand_count(), 3U);
+
+  const std::vector A{0, 1, 2, 3, 4, 5};
+  const std::vector B{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};
+  const auto res = suffixed(view_of<2, 3>(A), view_of<3, 4>(B));
+  BOOST_REQUIRE(res.has_value());
+  const auto same = angled(view_of<2, 3>(A), view_of<3, 4>(B));
+  BOOST_REQUIRE(same.has_value());
+  BOOST_CHECK_EQUAL(at(*res, 1, 2), at(*same, 1, 2));
+}
+
 BOOST_AUTO_TEST_CASE(EinsumTest_2DMatrix1) {
   const std::vector A{0, 1, 2, 3, 4, 5};
   const std::vector B{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12};

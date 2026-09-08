@@ -15,11 +15,10 @@ einsum_target_flags(einsum_parse_objs EXCEPTIONS)
 # anyway, and a Boost.Parser TU is ten seconds whatever else is precompiled.
 
 # --- the library -------------------------------------------------------------
-if (EINSUM_BUILD_SHARED_RT)
-    add_library(einsum_rt SHARED boost_no_exceptions.cpp)
-else ()
-    add_library(einsum_rt STATIC boost_no_exceptions.cpp)
-endif ()
+# Shared, always.  It carries one translation unit and two exported functions,
+# and every consumer of it -- the Python extension included -- wants the
+# versioned .so beside them rather than a copy of the parser in each.
+add_library(einsum_rt SHARED boost_no_exceptions.cpp)
 add_library(einsum::rt ALIAS einsum_rt)
 
 set_target_properties(einsum_rt PROPERTIES

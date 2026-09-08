@@ -92,8 +92,9 @@ template <COperand X>
       return B{typename B::extents_type{}};
     } else {
       std::array<std::size_t, rank_v<B>> ext{};
-      std::ranges::transform(*fitted, ext.begin(),
-                             [](const index_t e) { return static_cast<std::size_t>(e); });
+      std::ranges::transform(*fitted, ext.begin(), [](const index_t e) {
+        return static_cast<std::size_t>(e);
+      });
       return B{typename B::extents_type{ext}};
     }
   } else if constexpr (CEigenTensor<B>) {

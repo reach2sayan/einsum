@@ -9,21 +9,47 @@ permissions:
   contents: write
 
 jobs:
+  # Before an hour of wheel builds: the tag and the version CMake writes have to
+  # be the same number.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag and project(EinsteinSummation VERSION ...) must agree
+        run: |
+          written=$(sed -n 's/^project(EinsteinSummation VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          tagged="${GITHUB_REF_NAME#v}"
+          test "$written" = "$tagged" || {
+            echo "CMakeLists.txt says $written, the tag says $tagged"; exit 1; }
+
+  wheels:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: pypa/cibuildwheel@v3.1.1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
   release:
+    needs: wheels
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
-
-      # The header-only library only: einsum::rt::plan() is compiled into
-      # libeinsum_rt and cannot travel in a header.
-      - name: Regenerate single header
-        run: python3 scripts/amalgamate.py
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
 
       - name: Create GitHub Release
         env:
@@ -32,4 +58,4 @@ jobs:
           gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
-            single_include/einsum.hpp
+            dist/*.whl

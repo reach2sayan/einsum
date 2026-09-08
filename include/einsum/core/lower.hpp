@@ -179,7 +179,8 @@ bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
     return fail(errc::operand_count_mismatch);
   }
   BoundExtents bound;
-  for (const auto &[input, labels] : std::views::zip(inputs, plan.subscripts().operands)) {
+  for (const auto &[input, labels] :
+       std::views::zip(inputs, plan.subscripts().operands)) {
     if (input.rank() != labels.size()) {
       return fail(errc::rank_mismatch);
     }
@@ -213,7 +214,8 @@ bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
         slot.extent = extent;
         slot.broadcast = true;
       } else {
-        return fail(is_broadcast_label(c) ? errc::broadcast_mismatch : errc::extent_conflict);
+        return fail(is_broadcast_label(c) ? errc::broadcast_mismatch
+                                          : errc::extent_conflict);
       }
     }
   }
@@ -264,8 +266,8 @@ struct Bump {
 } // namespace detail
 
 [[nodiscard]] constexpr result<Geometry>
-make_geometry(const Plan &plan, const std::span<const Layout> inputs, const Layout &out,
-              const path order = path::greedy) noexcept {
+make_geometry(const Plan &plan, const std::span<const Layout> inputs,
+              const Layout &out, const path order = path::greedy) noexcept {
   const auto bound = bind_extents(plan, inputs);
   if (!bound) {
     return std::unexpected{bound.error()};
@@ -295,10 +297,10 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs, const Layo
       pg.merged.shape.push_back((*bound)[c].extent);
       pg.merged.strides.push_back(0);
     }
-    // A stretched axis contributes no stride: every index along it reads the one
-    // element the operand actually has.  collapse() already refuses a run whose
-    // stride is zero, so such an operand takes the packing path and no kernel
-    // has to know that broadcasting exists.
+    // A stretched axis contributes no stride: every index along it reads the
+    // one element the operand actually has.  collapse() already refuses a run
+    // whose stride is zero, so such an operand takes the packing path and no
+    // kernel has to know that broadcasting exists.
     for (const auto &[c, extent, stride, into] :
          std::views::zip(plan.subscripts().operands[oi], input.shape,
                          input.strides, prep.merged_into)) {
@@ -362,14 +364,15 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs, const Layo
   for (const auto i : std::views::iota(std::size_t{0}, inputs.size())) {
     live_labels.push_back(access::preps(plan)[i].labels_after);
   }
-  const auto chosen =
-      choose_path(order, std::span<const Labels>{live_labels}, plan.output_labels(), *bound);
+  const auto chosen = choose_path(order, std::span<const Labels>{live_labels},
+                                  plan.output_labels(), *bound);
   if (!chosen) {
     return std::unexpected{chosen.error()};
   }
   geom.path = *chosen;
 
-  for (const auto si : std::views::iota(std::size_t{0}, geom.path.steps.size())) {
+  for (const auto si :
+       std::views::iota(std::size_t{0}, geom.path.steps.size())) {
     const Step &step = geom.path.steps[si];
     const Source &left = sources[step.l_src];
     const Source &right = sources[step.r_src];

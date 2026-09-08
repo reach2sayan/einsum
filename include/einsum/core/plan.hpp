@@ -37,8 +37,8 @@ struct Prep {
 // sides, k is what is summed.  Nothing here mentions an extent: a Plan is the
 // shape of the computation, not of the data.
 // Where a step's two sides come from: an operand by index, or the result of an
-// earlier step, which is kIntermediate plus that step's index.  A path chosen by
-// cost does not contract left to right, so a step has to say.
+// earlier step, which is kIntermediate plus that step's index.  A path chosen
+// by cost does not contract left to right, so a step has to say.
 inline constexpr std::uint8_t kIntermediate = kMaxOperands;
 
 struct Step {
@@ -63,8 +63,8 @@ struct BoundExtent {
   bool known = false;
   bool broadcast = false;
 
-  [[nodiscard]] friend constexpr bool operator==(const BoundExtent &,
-                                                 const BoundExtent &) noexcept = default;
+  [[nodiscard]] friend constexpr bool
+  operator==(const BoundExtent &, const BoundExtent &) noexcept = default;
 };
 
 using BoundExtents = impl::LabelTable<BoundExtent>;

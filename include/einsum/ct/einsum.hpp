@@ -52,11 +52,24 @@ public:
     return ct::all_static<Ops...>() && sizeof...(Ops) == operand_count();
   }
 
-  // einsum<"ij,jk->ik">(a, b)      -> result<R>, by value
-  // einsum<"ij,jk->ik">(a, b, out) -> result<void>, moved into out
+  // einsum<"ij,jk->ik">(a, b)           -> result<R>, by value
+  // einsum<"ij,jk->ik">(a, b, out)      -> result<void>, moved into out
+  // einsum<"ij,jk->ik">(a, b, out(x))   -> the same, spelled as the runtime
+  //                                        path has to spell it
+  //
+  // The count is a constant here, so the untagged form is unambiguous and stays
+  // -- but out() is accepted too, so a call moves between the two paths without
+  // being rewritten.
   template <typename... A> [[nodiscard]] auto operator()(A &&...args) const {
     constexpr std::size_t n = sizeof...(A);
-    if constexpr (n == operand_count() + 1) {
+    if constexpr (impl::is_rt_out_form<A...>()) {
+      static_assert(n == operand_count() + 1,
+                    "einsum<\"...\">: out(x) is one argument past the operands "
+                    "the subscript names, and this call has a different number "
+                    "of them");
+      return this->untag_output(std::forward_as_tuple(EINSUM_FWD(args)...),
+                                std::make_index_sequence<n - 1>{});
+    } else if constexpr (n == operand_count() + 1) {
       return this->with_output(std::forward_as_tuple(EINSUM_FWD(args)...),
                                std::make_index_sequence<n - 1>{});
     } else {
@@ -75,7 +88,11 @@ public:
       } else if constexpr (lowers_statically<A...>()) {
         return statically(args...);
       } else {
-        return Einsum::operator()(args...);
+        // by_value, not operator(): the arity is a constant here and has
+        // already settled that this is not the output form, and the runtime
+        // operator() would ask again -- by constness, which a mutable operand
+        // would answer wrongly.
+        return this->by_value(args...);
       }
     }
   }
@@ -235,6 +252,44 @@ public:
 // rather than two different kinds of entity, which C++ will not have.
 template <impl::FixedString S, path P = path::greedy>
 [[nodiscard]] StaticEinsum<S, P> einsum() noexcept {
+  return {};
+}
+
+// --- the subscript as an argument --------------------------------------------
+// A function argument is never a constant expression, so einsum("ij,jk->ik")
+// cannot be the compile-time call however it is written -- the subscript has to
+// reach a template parameter, and only a literal operator template can put it
+// there while still looking like a string.  That is the whole of what _ct is:
+// an empty type carrying S, so that the two paths are one name taking one
+// string and differ by a suffix rather than by a syntax.
+namespace ct {
+
+template <einsum::impl::FixedString S, path P = path::greedy>
+struct Subscript {
+  // "ab,bc,cd->ad"_ct.with<path::sequential>() -- the contraction order chosen
+  // where the subscript is written, since it cannot be a second argument for
+  // the same reason the subscript cannot be a first one.
+  template <path Q>
+  [[nodiscard]] consteval Subscript<S, Q> with() const noexcept {
+    return {};
+  }
+};
+
+} // namespace ct
+
+inline namespace literals {
+
+template <impl::FixedString S>
+[[nodiscard]] consteval ct::Subscript<S> operator""_ct() noexcept {
+  return {};
+}
+
+} // namespace literals
+
+// einsum("ij,jk->ik"_ct) -- the same object einsum<"ij,jk->ik">() answers, and
+// what the suffix exists for.
+template <impl::FixedString S, path P>
+[[nodiscard]] StaticEinsum<S, P> einsum(ct::Subscript<S, P>) noexcept {
   return {};
 }
 

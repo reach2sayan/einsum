@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+# Nothing to find: Boost, Eigen and mdspan were installed into this prefix's
+# include directory beside einsum's own headers, so the one include path the
+# targets below carry is all of them.  See cmake/EinsumInstall.cmake.
+include("${CMAKE_CURRENT_LIST_DIR}/einsumTargets.cmake")
+
+set(einsum_einsum_FOUND TRUE)
+set(einsum_rt_FOUND TRUE)
+
+check_required_components(einsum)

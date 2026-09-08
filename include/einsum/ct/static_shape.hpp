@@ -87,17 +87,18 @@ template <typename Op>
                                     index_t{B::ColsAtCompileTime}}
                             : Shape{index_t{B::RowsAtCompileTime},
                                     index_t{B::ColsAtCompileTime}};
-    return einsum::impl::make_layout(shape, row_order ? einsum::impl::row_major : einsum::impl::col_major);
+    return einsum::impl::make_layout(
+        shape, row_order ? einsum::impl::row_major : einsum::impl::col_major);
   } else if constexpr (einsum::impl::CMdspanLike<B>) {
     using E = typename B::extents_type;
     Shape shape;
     for (const auto i : std::views::iota(std::size_t{0}, E::rank())) {
       shape.push_back(static_cast<index_t>(E::static_extent(i)));
     }
-    return einsum::impl::make_layout(shape,
-                       std::same_as<typename B::layout_type, std::layout_right>
-                           ? einsum::impl::row_major
-                           : einsum::impl::col_major);
+    return einsum::impl::make_layout(
+        shape, std::same_as<typename B::layout_type, std::layout_right>
+                   ? einsum::impl::row_major
+                   : einsum::impl::col_major);
   } else {
     Shape shape;
     einsum::ct::impl::static_array_extents<B>(shape);
@@ -119,7 +120,8 @@ template <Shape S>
 using extents_of_t =
     decltype(detail::extents_from<S>(std::make_index_sequence<S.size_>{}));
 
-static_assert(std::same_as<extents_of_t<Shape{2, 3}>, std::extents<std::size_t, 2, 3>>);
+static_assert(
+    std::same_as<extents_of_t<Shape{2, 3}>, std::extents<std::size_t, 2, 3>>);
 static_assert(std::same_as<extents_of_t<Shape{}>, std::extents<std::size_t>>);
 
 // The view family's result when the whole lowering is a constant: every extent
@@ -128,12 +130,10 @@ static_assert(std::same_as<extents_of_t<Shape{}>, std::extents<std::size_t>>);
 // vector; both are mdarrays, so a caller who moves a call from one path to the
 // other keeps the same indexing.
 template <einsum::CScalar T, Shape S>
-using static_mdarray_t =
-    std::experimental::mdarray<T, extents_of_t<S>, std::layout_right,
-                               std::array<T, static_cast<std::size_t>(
-                                                 einsum::impl::product(S)) == 0
-                                                 ? 1
-                                                 : static_cast<std::size_t>(
-                                                       einsum::impl::product(S))>>;
+using static_mdarray_t = std::experimental::mdarray<
+    T, extents_of_t<S>, std::layout_right,
+    std::array<T, static_cast<std::size_t>(einsum::impl::product(S)) == 0
+                      ? 1
+                      : static_cast<std::size_t>(einsum::impl::product(S))>>;
 
 } // namespace einsum::ct

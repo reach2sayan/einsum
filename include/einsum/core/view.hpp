@@ -279,7 +279,6 @@ measure_nest(const X &x, std::array<index_t, R> &ext,
   }
 }
 
-
 template <COperand X>
 [[nodiscard]] constexpr result<Shape> shape_of(const X &x) noexcept {
   using B = std::remove_cvref_t<X>;
@@ -343,7 +342,6 @@ element_at(X &&x, const std::array<index_t, R> &at,
     return EINSUM_FWD(x)[at[I]...];
   }
 }
-
 
 template <COperand X>
 [[nodiscard]] constexpr decltype(auto)
