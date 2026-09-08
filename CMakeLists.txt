@@ -35,7 +35,10 @@ include(EinsumCompileOptions)
 include(EinsumDependencies)
 
 option(EINSUM_BUILD_TESTS "Build the Boost.Test suites" ON)
-option(EINSUM_BUILD_BENCHMARKS "Build the Google Benchmark suite" ON)
+# Off, and off by default because benchmark/ is not in the repository: it is a
+# local working directory, ignored by git, and a clone does not have one.  Turn
+# it on in a tree that does.
+option(EINSUM_BUILD_BENCHMARKS "Build the Google Benchmark suite" OFF)
 option(EINSUM_BUILD_PYTHON "Build the pybind11 extension module" OFF)
 # Off here, on in the Linux wheel (pyproject.toml) and the python preset.  A
 # library that spawns threads is a different thing from one that does not, so
@@ -176,6 +179,13 @@ if (EINSUM_BUILD_TESTS)
 endif ()
 
 if (EINSUM_BUILD_BENCHMARKS)
+    # Asked for and absent is a mistake worth naming here, rather than the
+    # add_subdirectory error, which says only that a CMakeLists is missing.
+    if (NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/CMakeLists.txt")
+        message(FATAL_ERROR
+                "EINSUM_BUILD_BENCHMARKS is ON but benchmark/ is not in this "
+                "tree.  It is untracked -- a clone does not carry one.")
+    endif ()
     add_subdirectory(benchmark)
 endif ()
 
