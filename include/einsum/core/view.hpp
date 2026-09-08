@@ -307,8 +307,23 @@ element_at(X &&x, const std::array<index_t, R> &at,
     return EINSUM_FWD(x)(at[I]...);
   } else if constexpr (CNestedIndexable<B>) {
     return nest_at<0>(EINSUM_FWD(x), at);
-  } else {
+  } else if constexpr (requires { EINSUM_FWD(x)[at[I]...]; }) {
+    // The mdspan family, on a compiler that has P2128.
     return EINSUM_FWD(x)[at[I]...];
+  } else {
+    // The same family without it.  mdspan and mdarray declare the variadic
+    // `operator[]` only under __cpp_multidimensional_subscript and fall back to
+    // `operator()` otherwise -- MDSPAN_USE_BRACKET_OPERATOR against
+    // MDSPAN_USE_PAREN_OPERATOR in its config.hpp, and exactly one of the two
+    // is ever defined.  MSVC is currently the compiler that lands here.
+    //
+    // Not a tidier spelling of the line above: for rank 2 and up, `x[i, j]` on
+    // a type without that operator is not an error a fallback would rescue, it
+    // is the comma operator inside a subscript -- `x[(i, j)]`, which evaluates
+    // i, discards it, and indexes with j.  Where that compiles at all it reads
+    // the wrong element, and the only sign is C4834 pointing at the discarded
+    // `std::array::operator[]` in a warning most builds never surface.
+    return EINSUM_FWD(x)(at[I]...);
   }
 }
 

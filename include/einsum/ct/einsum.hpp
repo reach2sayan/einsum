@@ -140,29 +140,43 @@ private:
 
     // One mappable GEMM, nothing packed or summed first: the case Eigen
     // unrolls rather than blocks.
+    // Every test below is over a static constexpr, so each one is `if
+    // constexpr`: a plain `if` on a constant is what MSVC reports as C4127, and
+    // it is right that there is nothing to decide at run time here.
+    //
+    // The nesting is not stylistic.  An `if constexpr` condition is evaluated
+    // whenever the branch is reached during instantiation, control flow above
+    // it notwithstanding, so `geometry.preps[1]` cannot sit in a sibling test
+    // the way it did behind an early `return`: at one operand that subscript is
+    // out of bounds, and out of bounds in a constant expression is an error
+    // rather than a false.  Putting the arity first and the rest inside its
+    // else is what keeps the later conditions from being formed at all until
+    // they are known to be well defined.
     static constexpr bool fixed_gemm = [] {
-      if (sizeof...(Ops) != 2 || geometry.steps.size() != 1 || !direct) {
+      if constexpr (sizeof...(Ops) != 2) {
         return false;
-      }
-      if (geometry.preps[0].reduced || geometry.preps[1].reduced) {
+      } else if constexpr (geometry.steps.size() != 1 || !direct) {
         return false;
-      }
-      if (std::ranges::contains(gathered, true)) {
+      } else if constexpr (geometry.preps[0].reduced ||
+                           geometry.preps[1].reduced) {
         return false;
+      } else if constexpr (std::ranges::contains(gathered, true)) {
+        return false;
+      } else {
+        const impl::StepGeom &step = geometry.steps[0];
+        // Packed in whichever order it is stored in: a row-major rectangle's
+        // outer stride is its column count, a column-major one's its row count.
+        // Requiring row-major would miss Eigen's own default order.
+        const auto packed = [](const impl::Slab &slab, const index_t rows,
+                               const index_t cols) {
+          return slab.mappable &&
+                 slab.outer_stride == (slab.transposed ? rows : cols);
+        };
+        return step.batches() == 1 && !step.hadamard() &&
+               packed(step.l, step.m(), step.k()) &&
+               packed(step.r, step.k(), step.n()) &&
+               packed(step.out, step.m(), step.n());
       }
-      const impl::StepGeom &step = geometry.steps[0];
-      // Packed in whichever order it is stored in: a row-major rectangle's
-      // outer stride is its column count, a column-major one's its row count.
-      // Requiring row-major would miss Eigen's own default order.
-      const auto packed = [](const impl::Slab &slab, const index_t rows,
-                             const index_t cols) {
-        return slab.mappable &&
-               slab.outer_stride == (slab.transposed ? rows : cols);
-      };
-      return step.batches() == 1 && !step.hadamard() &&
-             packed(step.l, step.m(), step.k()) &&
-             packed(step.r, step.k(), step.n()) &&
-             packed(step.out, step.m(), step.n());
     }();
   };
 
@@ -208,10 +222,9 @@ private:
       // than a pooled block.
       static constexpr auto kFitted =
           einsum::impl::fit_shape(L::shape, rank_v<R>).value_or(Shape{});
-      einsum::impl::contract_into<T>(L::plan, L::geometry,
-                                     std::span<const impl::Layout>{L::layouts},
-                                     L::out_layout, scratch.data(), L::map, *out,
-                                     kFitted, ops...);
+      einsum::impl::contract_into<T>(
+          L::plan, L::geometry, std::span<const impl::Layout>{L::layouts},
+          L::out_layout, scratch.data(), L::map, *out, kFitted, ops...);
       return result<R>{std::move(*out)};
     }
   }
@@ -238,8 +251,7 @@ template <impl::FixedString S, path P = path::greedy>
 // looking like a string.
 namespace ct {
 
-template <einsum::impl::FixedString S, path P = path::greedy>
-struct Subscript {
+template <einsum::impl::FixedString S, path P = path::greedy> struct Subscript {
   // The order chosen where the subscript is written, since it cannot be an
   // argument for the same reason the subscript cannot.
   template <path Q>
