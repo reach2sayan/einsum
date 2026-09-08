@@ -5,12 +5,25 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # So the Windows legs can be re-run from a branch without a push while they
+  # are still being brought up.
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Skip intermediate builds always; cancel them only on a pull request, where a
+# superseded run has nothing left to say.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
 jobs:
+  # The `name:` on every job below is what a branch ruleset names as a required
+  # status check -- see .github/rulesets/main.json -- so these strings are load
+  # bearing and renaming one silently stops that check being required.
   build:
+    name: ${{ matrix.cxx }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -57,10 +70,179 @@ jobs:
       - name: Test
         run: ctest --preset release
 
+  # --- Windows ----------------------------------------------------------------
+  # Two jobs, both advisory for now.  continue-on-error is deliberate and
+  # temporary: nothing here had ever been compiled by cl.exe -- cmake/ carried
+  # MSVC branches nobody had run -- and the cheapest way to find out what MSVC
+  # thinks is to let it say so on every push without blocking anyone.
+  #
+  # Ending that period has to be deliberate, because continue-on-error masks a
+  # job's conclusion to success whether its steps passed or failed: in the run
+  # list a working MSVC job and a broken one look the same, and only the
+  # step-level conclusions tell them apart.  CONTRIBUTING.md says what flipping
+  # it involves.
+  #
+  # The same `release` and `python` presets the Linux jobs use, with the
+  # compiler overridden on the command line -- the presets pin no compiler, so
+  # there is no Windows-specific project configuration anywhere.  Release only:
+  # MSVC Debug turns on _ITERATOR_DEBUG_LEVEL=2, which would say nothing about
+  # portability and would pay for the compile-time planner twice.
+  build-windows:
+    name: MSVC 2022 (release)
+    runs-on: windows-2022
+    continue-on-error: true
+    # The default is 360.  What wants bounding here is a runaway constant
+    # evaluation: the whole planner runs at compile time, on an evaluator
+    # slower and hungrier than GCC's.
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (x64)
+        uses: ./.github/actions/msvc-x64
+
+      # sccache, not ccache: ccache's cl.exe support is narrow.  Unlike ccache
+      # on Linux, EinsumCompileOptions.cmake does not go looking for it, so the
+      # launcher is passed below -- with the embedded debug format, which is
+      # what lets sccache cache the output at all (it cannot cache a separate
+      # PDB).
+      - name: Set up sccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          variant: sccache
+          key: msvc-release
+          max-size: 500M
+
+      # C:/d, not the workspace: Boost unpacked under
+      # D:\a\Einstein_Summation\Einstein_Summation\.deps\boost-1.92.0\... runs
+      # into MAX_PATH long before the compiler sees any of it.
+      - name: Cache the pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: C:/d
+          key: deps-msvc-${{ hashFiles('cmake/EinsumDependencies.cmake') }}
+          restore-keys: deps-msvc-
+
+      # No CXX in the environment: cl is named here instead, which is also what
+      # keeps the pre-project() g++ preference in CMakeLists.txt out of it.  The
+      # vendored-header check is off by default on Windows -- vendor_headers.py
+      # asks for the include closure with `-M`, which cl.exe has no spelling for.
+      - name: Configure
+        run: >
+          cmake --preset release
+          -DCMAKE_C_COMPILER=cl
+          -DCMAKE_CXX_COMPILER=cl
+          -DEINSUM_DEPS_DIR=C:/d
+          -DCMAKE_C_COMPILER_LAUNCHER=sccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+          -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+
+      - name: Build
+        run: cmake --build --preset release
+
+      - name: Test
+        run: ctest --preset release
+
+      - name: Install
+        run: cmake --install build/release --prefix "${{ github.workspace }}/prefix"
+
+      # The same claim the Linux install job makes, minus the vendored-header
+      # check: that list is one GCC's include closure and stays Linux's to
+      # regenerate.  What is still worth proving here is the other half -- that
+      # the directories it names are enough for a consumer MSVC compiles, which
+      # can fail on its own.
+      - name: Build a consumer against the prefix alone
+        shell: bash
+        run: |
+          mkdir -p consumer && cd consumer
+          cat > CMakeLists.txt <<'CMAKE'
+          cmake_minimum_required(VERSION 3.26)
+          project(consumer LANGUAGES CXX)
+          find_package(einsum REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE einsum::einsum einsum::rt)
+          CMAKE
+          cat > main.cpp <<'CPP'
+          #include <einsum/einsum.hpp>
+          #include <einsum/rt/parse.hpp>
+          #include <Eigen/Core>
+
+          int main() {
+            using einsum::literals::operator""_ct;
+            const Eigen::MatrixXd a = Eigen::MatrixXd::Ones(3, 4);
+            const Eigen::MatrixXd b = Eigen::MatrixXd::Ones(4, 2);
+            const auto rt = einsum::einsum("ij,jk->ik");
+            const auto ct = einsum::einsum("ij,jk->ik"_ct);
+            return (*(*rt)(a, b))(0, 0) == 4.0 && (*ct(a, b))(0, 0) == 4.0 ? 0 : 1;
+          }
+          CPP
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl \
+                -DCMAKE_PREFIX_PATH="$GITHUB_WORKSPACE/prefix"
+          cmake --build build
+          # No rpath on this platform: einsum_rt.dll installs to <prefix>/bin and
+          # the loader is told where by PATH and nothing else.
+          PATH="$GITHUB_WORKSPACE/prefix/bin:$PATH" ./build/consumer.exe
+
+  # Its own job rather than steps in the one above, because the two fail for
+  # unrelated reasons -- compiler and library maturity there, extension loading
+  # and interpreter plumbing here -- and a combined job would need triage on
+  # every red run to tell which.
+  python-windows:
+    name: python bindings (Windows)
+    runs-on: windows-2022
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSVC (x64)
+        uses: ./.github/actions/msvc-x64
+
+      # A real CPython, so the venv uv builds on it carries the
+      # libs/python3*.lib that FindPython's Development.Module resolves against.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Cache the pinned dependencies
+        uses: actions/cache@v4
+        with:
+          path: C:/d
+          key: deps-msvc-${{ hashFiles('cmake/EinsumDependencies.cmake') }}
+          restore-keys: deps-msvc-
+
+      - name: Python environment
+        run: uv sync --group dev --no-install-project
+
+      - name: Configure and build
+        run: |
+          cmake --preset python -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DEINSUM_DEPS_DIR=C:/d
+          cmake --build --preset python
+
+      - name: Test
+        run: ctest --preset python
+
+      # No stub-freshness check here, unlike the Linux python job.  The runner
+      # sets core.autocrlf=true and the tree carries no .gitattributes, so
+      # `git diff --exit-code` on a generated .pyi is a line-ending coin flip
+      # carrying no portability signal.  The Linux job already answers it.
+
+      - name: Install the wheel and import it elsewhere
+        shell: bash
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/wheel"
+          VIRTUAL_ENV="$RUNNER_TEMP/wheel" uv pip install . pytest
+          cd "$RUNNER_TEMP" && "$RUNNER_TEMP/wheel/Scripts/python.exe" -m pytest -q "$GITHUB_WORKSPACE/python/tests"
+
   # The install is the distribution: an installed einsum carries Boost, Eigen and
   # mdspan, so what can rot is the list saying which parts.  This builds a
   # consumer against the prefix and nothing else on the machine.
   install:
+    name: install and consume
     runs-on: ubuntu-24.04
     needs: build
     steps:
@@ -130,6 +312,7 @@ jobs:
           ./build/consumer
 
   python:
+    name: python bindings
     runs-on: ubuntu-24.04
     needs: build
     steps:

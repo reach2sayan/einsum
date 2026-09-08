@@ -4,7 +4,11 @@ cmake_minimum_required(VERSION 3.26)
 # project(): the default g++ here is 13, whose libstdc++ has no
 # std::views::enumerate and no std::from_range, so it is below the floor the
 # toolchain probe checks for.
-if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
+# CMAKE_HOST_WIN32, not WIN32: this runs before project(), which is where WIN32
+# is decided.  On Windows the compiler is whatever vcvars put on PATH, and a
+# stray MinGW g++ is not what this preference is for.
+if (NOT CMAKE_HOST_WIN32
+        AND CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR
         AND NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
     find_program(EINSUM_PREFERRED_CXX NAMES g++-15 g++-14)
     if (EINSUM_PREFERRED_CXX)
@@ -75,9 +79,21 @@ target_compile_features(einsum INTERFACE cxx_std_23)
 # who built last.  The stamp is what keeps this off the hot path -- the script
 # runs a compiler, so it reruns only when a public header, the pins, the script
 # or the list itself changes.
+#
+# Off on Windows whatever else is true: scripts/vendor_headers.py asks the
+# compiler for the closure with `-std=c++23 ... -M`, which is a GCC/Clang
+# spelling cl.exe does not have.  The list stays a Linux-generated artifact --
+# it already carries the MSVC arms of boost/config and boost/preprocessor,
+# because those three trees are vendored whole -- so an MSVC build consumes it
+# happily and simply does not re-derive it.
+if (WIN32)
+    set(EINSUM_CHECK_VENDORED_HEADERS_DEFAULT OFF)
+else ()
+    set(EINSUM_CHECK_VENDORED_HEADERS_DEFAULT ${PROJECT_IS_TOP_LEVEL})
+endif ()
 option(EINSUM_CHECK_VENDORED_HEADERS
         "Fail the build when cmake/EinsumVendoredHeaders.cmake is stale"
-        ${PROJECT_IS_TOP_LEVEL})
+        ${EINSUM_CHECK_VENDORED_HEADERS_DEFAULT})
 if (EINSUM_CHECK_VENDORED_HEADERS)
     find_package(Python 3.11 QUIET COMPONENTS Interpreter)
     if (NOT Python_Interpreter_FOUND)
@@ -120,6 +136,7 @@ target_link_libraries(main PRIVATE einsum::einsum einsum::rt)
 einsum_target_flags(main)
 einsum_target_pch(main)
 einsum_target_trace(main)
+einsum_runtime_deps(main)
 
 enable_testing()
 if (EINSUM_BUILD_TESTS)

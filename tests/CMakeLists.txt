@@ -6,12 +6,24 @@
 # tests_noalloc replaces operator new for the whole of its own.
 set(EINSUM_TEST_SUITES tests_parse tests_ct tests_rt tests_noalloc)
 
+# Not on MSVC.  Replacing operator new is program-wide on ELF, where the suite
+# and libeinsum_rt resolve it to the one definition; a DLL keeps the CRT's.  So
+# the count this suite asserts on would miss every allocation made behind
+# einsum_rt.dll -- and worse, a block the DLL's new returned would reach the
+# std::free in this suite's delete, which is the CRT's heap and not malloc's.
+# The suite is a statement about the library's allocation behaviour, not about
+# the platform, and Linux is where it can still be made.
+if (MSVC)
+    list(REMOVE_ITEM EINSUM_TEST_SUITES tests_noalloc)
+endif ()
+
 foreach (suite IN LISTS EINSUM_TEST_SUITES)
     add_executable(${suite} ${suite}.cpp)
     target_link_libraries(${suite} PRIVATE einsum::einsum einsum::rt)
     einsum_target_flags(${suite} EXCEPTIONS)
     einsum_target_pch(${suite})
     einsum_target_trace(${suite})
+    einsum_runtime_deps(${suite})
     add_test(NAME ${suite} COMMAND ${suite})
 endforeach ()
 
@@ -52,7 +64,13 @@ foreach (i RANGE 0 ${_einsum_last} 2)
     add_executable(${case} EXCLUDE_FROM_ALL ${case}.cpp)
     target_link_libraries(${case} PRIVATE einsum::einsum)
     # No einsum_target_flags: -Werror would make an unrelated warning look like
-    # the refusal this test is about.
+    # the refusal this test is about.  /Zc:preprocessor is the exception, and
+    # has to be named here for that same reason: the sentence these match is
+    # built by Boost.Preprocessor, and without a conformant preprocessor the
+    # build fails with a macro error instead of the static_assert -- a pass, by
+    # a regex that never matched.
+    target_compile_options(${case} PRIVATE
+            $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>)
     add_test(NAME ${case}
             COMMAND ${CMAKE_COMMAND} --build ${CMAKE_BINARY_DIR} --target ${case} --config $<CONFIG>)
     set_tests_properties(${case} PROPERTIES PASS_REGULAR_EXPRESSION "${expected}")

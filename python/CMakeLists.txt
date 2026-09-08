@@ -13,6 +13,7 @@ target_compile_definitions(einsum_python PRIVATE
 # conversion in this TU can raise one.  No PCH: the shared one is built
 # -fno-exceptions and would not be reusable here.
 einsum_target_flags(einsum_python EXCEPTIONS)
+einsum_runtime_deps(einsum_python)
 
 set_target_properties(einsum_python PROPERTIES
         INSTALL_RPATH "$<IF:$<PLATFORM_ID:Darwin>,@loader_path,$ORIGIN>"
@@ -35,9 +36,13 @@ set(EINSUM_PYTHON_PACKAGE "${CMAKE_CURRENT_BINARY_DIR}/einsum")
 set_target_properties(einsum_python PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "$<1:${EINSUM_PYTHON_PACKAGE}>")
 # Beside it, so PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR} is an importable package
-# with no wheel and no install step.
+# with no wheel and no install step.  Both directories, because which one a
+# shared library lands in is the platform's choice: the .so is a LIBRARY
+# artifact and the .dll is a RUNTIME one.  (_einsum itself needs only the first:
+# a MODULE library is a LIBRARY artifact everywhere, Windows included.)
 set_target_properties(einsum_rt PROPERTIES
-        LIBRARY_OUTPUT_DIRECTORY "$<1:${EINSUM_PYTHON_PACKAGE}>")
+        LIBRARY_OUTPUT_DIRECTORY "$<1:${EINSUM_PYTHON_PACKAGE}>"
+        RUNTIME_OUTPUT_DIRECTORY "$<1:${EINSUM_PYTHON_PACKAGE}>")
 
 file(GLOB EINSUM_PYTHON_SOURCES CONFIGURE_DEPENDS
         "einsum/*.py" "einsum/py.typed" "einsum/*.pyi")

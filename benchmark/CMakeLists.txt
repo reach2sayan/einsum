@@ -5,6 +5,7 @@ target_link_libraries(einsum_benchmark PRIVATE einsum::einsum einsum::rt benchma
 einsum_target_flags(einsum_benchmark)
 einsum_target_pch(einsum_benchmark)
 einsum_target_trace(einsum_benchmark)
+einsum_runtime_deps(einsum_benchmark)
 
 # `cmake --build ... --target benchmark_json` leaves a machine-readable run
 # beside the binary, which is what a before/after comparison reads.

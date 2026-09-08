@@ -1,0 +1,33 @@
+# The wheel matrix, called and never triggered.  Release runs it for a tag and
+# publishes what comes out; Trial release runs the same thing on demand and
+# publishes nothing.  One copy, because a trial that built wheels a different
+# way would not be a trial of anything.
+name: Wheels
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      # cibuildwheel reads [tool.cibuildwheel] in pyproject.toml: the
+      # interpreters, the manylinux image and its gcc-toolset-15, and the
+      # per-wheel `pytest {package}/python/tests` that has to pass before a
+      # wheel is kept.  Nothing about the build lives here.
+      - uses: pypa/cibuildwheel@v3.1.1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
