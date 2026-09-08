@@ -19,8 +19,8 @@ namespace einsum {
 // inside the GEMM loop.
 struct Prep {
   Labels merged_labels{}; // one per distinct label, first occurrence order
-  // Per original axis, which merged axis it folds into.  Two axes sharing one
-  // means a diagonal, whose stride is the sum of theirs.
+  // Per original axis, which merged axis it folds into; two axes sharing one
+  // are a diagonal, whose stride is the sum of theirs.
   impl::FixedVec<std::uint8_t, kMaxRank> merged_into{};
   Labels reduce{};       // merged labels no other operand has and the output does not want
   Labels labels_after{}; // merged_labels minus reduce: what the steps see
@@ -29,13 +29,11 @@ struct Prep {
   operator==(const Prep &, const Prep &) noexcept = default;
 };
 
-// Where a step's side comes from: an operand by index, or an earlier step's
-// result, which is this plus that step's index.
+// A step's side: an operand by index, or this plus an earlier step's index.
 inline constexpr std::uint8_t kIntermediate = kMaxOperands;
 
-// One binary contraction, named by which labels play which role in it.  batch
-// is the pair of axes GEMM iterates over, m/n are the free axes of the two
-// sides, k is what is summed.  Nothing here mentions an extent.
+// One binary contraction: batch is what GEMM iterates over, m/n are the two
+// sides' free axes, k is what is summed.  No extents here.
 struct Step {
   Labels batch{};
   Labels m{};
@@ -50,8 +48,7 @@ struct Step {
   operator==(const Step &, const Step &) noexcept = default;
 };
 
-// What each label is bound to.  Here rather than in the lowering because a path
-// policy is chosen on extents and must be able to read them.
+// Here rather than in the lowering: a path is chosen on extents.
 struct BoundExtent {
   index_t extent = 0;
   bool known = false;
@@ -71,9 +68,8 @@ namespace impl {
 struct access;
 } // namespace impl
 
-// A parsed, lowered einsum: extent-free, allocation-free, a value type.  It is
-// the same object whichever parser built it, so a plan can be checked at
-// compile time and executed at run time.
+// Extent-free, allocation-free, a value type, and the same whichever parser
+// built it.
 class Plan {
 public:
   constexpr Plan() noexcept = default;
@@ -129,10 +125,8 @@ make_prep(const Labels &operand, const Labels &output,
   return prep;
 }
 
-// The subscript and what each operand must do to itself before it can take part
-// -- the diagonals it walks and the axes it sums away.  In what ORDER the
-// operands are then contracted depends on their extents, which a Plan has never
-// seen, so it belongs to the per-call lowering.
+// The order the operands are then contracted in depends on their extents,
+// which a Plan has never seen, so it belongs to the per-call lowering.
 [[nodiscard]] constexpr result<Plan>
 make_plan(const Subscripts &subs) noexcept {
   Plan plan;

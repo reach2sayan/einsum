@@ -51,11 +51,10 @@ struct Silent {
                           const Context &, Iter) const {}
 };
 
-// What the actions build.  Carried through with_globals rather than captured:
-// BOOST_PARSER_DEFINE_RULES wants its rules at namespace scope, where a lambda
-// has nothing to capture.  A synthesized attribute would not do either --
-// `(operand % ',') >> -("->" >> operand)` collapses the optional output
-// straight into the operand vector.
+// Carried through with_globals: BOOST_PARSER_DEFINE_RULES wants its rules at
+// namespace scope, and a synthesized attribute would not do either --
+// `(operand % ',') >> -("->" >> operand)` collapses the output into the
+// operand vector.
 struct Building {
   Subscripts subs{};
   Labels current{};
@@ -67,11 +66,9 @@ struct Building {
 
 namespace act {
 
-// One refusal shape for every limit: name the code, fail the parser, and let
-// the caller read `why` back once the whole parse has failed.  The first
-// refusal wins, because a failing parser backtracks into whatever the grammar
-// offers next: a ninth operand refused as too_many_operands must not be
-// re-reported as an empty one by the eps that follows it.
+// Name the code, fail the parser, and let the caller read `why` back.  The
+// first refusal wins: a failing parser backtracks, and the alternative's own
+// complaint would bury the one that mattered.
 template <errc C>
 constexpr auto refuse = [](auto &ctx) {
   Building &building = _globals(ctx);
@@ -92,8 +89,7 @@ constexpr auto push_label = [](auto &ctx) {
 
 constexpr auto end_operand = [](auto &ctx) {
   Building &building = _globals(ctx);
-  // The labels and the '...' position are one term and are stored together, so
-  // the two vectors cannot fall out of step.
+  // Stored together, so the two vectors cannot fall out of step.
   if (!building.subs.operands.try_push_back(building.current) ||
       !building.subs.ellipsis_at.try_push_back(building.current_ellipsis)) {
     refuse<errc::too_many_operands>(ctx);
@@ -126,10 +122,7 @@ constexpr auto begin_output = [](auto &ctx) {
 
 } // namespace act
 
-// --- the grammar -------------------------------------------------------------
-// Rules carry no attribute: the actions above write into the globals, and there
-// is nothing left for Boost.Parser to synthesize or for a merge rule to
-// reshape.
+// Rules carry no attribute: the actions write into the globals.
 bp::rule<struct label_tag> const label = "label";
 bp::rule<struct operand_tag> const operand = "operand";
 bp::rule<struct ellipsis_tag> const ellipsis = "ellipsis";
@@ -140,12 +133,10 @@ bp::rule<struct subscript_tag> const subscript = "subscript";
 constexpr auto letter = bp::char_('a', 'z') | bp::char_('A', 'Z');
 
 auto const label_def = letter[act::push_label];
-// A term is any mixture of labels and at most one '...', in any order, so that
-// "i...j" and "...ij" and "ij..." all parse and keep their position.
+// Labels and at most one '...', in any order, each keeping its position.
 auto const ellipsis_def = bp::lit("...")[act::mark_ellipsis];
 auto const operand_def = +(label | ellipsis);
-// eps after operand: a comma with nothing between it and the next one is an
-// empty operand, which is a different complaint from "this is not a subscript".
+// eps: an empty operand is a different complaint from a bad subscript.
 auto const inputs_def =
     (operand[act::end_operand] | bp::eps[act::refuse<errc::empty_operand>]) %
     ',';
@@ -162,8 +153,8 @@ result<Subscripts> parse_subscript(const std::string_view source) noexcept {
   }
 
   Building building;
-  // No expectation points in the grammar, so nothing below throws; the catch is
-  // what keeps that a property of this file rather than of every caller.
+  // No expectation points, so nothing below throws; the catch keeps that a
+  // property of this file rather than of every caller.
   const Silent quiet;
   const bool ok = [&]() noexcept {
     try {

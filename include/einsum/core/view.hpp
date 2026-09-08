@@ -84,14 +84,10 @@ template <CLayoutPolicy P>
   return {.shape = shape, .strides = P::strides(shape)};
 }
 
-// --- walking one -------------------------------------------------------------
-// Every offset a row-major walk over these layouts visits, in order.  The
-// layouts name the same axes of different tensors, so they share extents and
-// one carry serves all of them.
-//
-// The offsets are carried, not recomputed: a cartesian_product of iota views
-// reads better and is what this replaced, but recomputing the dot product per
-// element cost +82% on a 64x64 transpose and +45% on a batched matmul.
+// Every offset a row-major walk over these layouts visits, in order; they name
+// the same axes, so one carry serves all.  Carried, not recomputed: a
+// cartesian_product of iotas cost +82% on a 64x64 transpose, +45% on a batched
+// matmul.
 template <typename> using offset_arg_t = index_t;
 
 template <typename F, typename... L>
@@ -101,9 +97,8 @@ template <typename F, typename... L>
 constexpr void for_each_offset(F &&fn, const L &...layouts) noexcept {
   constexpr std::size_t kOperands = sizeof...(L);
 
-  // Copied into this frame: reading through the Layouts costs a pointer load
-  // and a value load per operand per step, and leaves the operand count a
-  // run-time bound the compiler will not unroll.
+  // Copied into this frame: reading through the Layouts costs two loads per
+  // operand per step and leaves the operand count a bound GCC will not unroll.
   const std::array<std::array<index_t, kMaxRank>, kOperands> strides{
       [](const Layout &one) {
         std::array<index_t, kMaxRank> row{};
@@ -130,8 +125,7 @@ constexpr void for_each_offset(F &&fn, const L &...layouts) noexcept {
       if (++at[axis] < extent[axis]) {
         break;
       }
-      // The axis wrapped: give back exactly what it has added since it last
-      // did.
+      // Wrapped: give back what it has added since it last did.
       step(axis, -extent[axis], std::make_index_sequence<kOperands>{});
       at[axis] = 0;
     }
@@ -177,8 +171,8 @@ struct TensorView {
   }
 };
 
-// A vector is rank 1 however it is stored; a matrix is rank 2 with the row
-// stride first, which for a column-major object is the inner one.
+// A matrix is rank 2 with the row stride first -- the inner one when it is
+// column-major.
 template <CEigenDense D>
 [[nodiscard]] Layout eigen_layout(const D &m) noexcept {
   Layout out;
@@ -229,10 +223,8 @@ as_view(const std::mdspan<T, E, L, A> &m) noexcept {
                        })}}};
 }
 
-// --- reading an operand ------------------------------------------------------
-// Depth D of R, measuring as it descends.  The first node at each level sets
-// that level's extent and every later one is held to it, so a ragged nest is
-// caught where it differs rather than read past a short row.
+// The first node at each level sets that level's extent and every later one is
+// held to it, so a ragged nest is caught rather than read past.
 template <std::size_t D, std::size_t R, typename X>
 [[nodiscard]] constexpr result<void>
 measure_nest(const X &x, std::array<index_t, R> &ext,
@@ -288,9 +280,7 @@ template <COperand X>
   }
 }
 
-// One element, whichever way its type spells the accessor.  The rank is in the
-// operand's type, so the index pack is built once and the families differ only
-// in how they consume it.
+// One element, whichever way its type spells the accessor.
 
 template <std::size_t D, typename X, std::size_t R>
 [[nodiscard]] constexpr decltype(auto)
@@ -323,9 +313,8 @@ element_at(X &&x, const std::array<index_t, rank_v<X>> &at) noexcept {
                           std::make_index_sequence<rank_v<X>>{});
 }
 
-// --- packing an operand the kernels can address ------------------------------
-// An operand whose memory is already a strided rectangle is handed to Eigen as
-// it stands; anything else is walked once and packed row-major into scratch.
+// A strided rectangle goes to Eigen as it stands; anything else is walked once
+// and packed row-major into scratch.
 template <typename X>
 concept CContiguous =
     impl::CEigenDense<std::remove_cvref_t<X>> || requires(const X &x) {
@@ -333,9 +322,8 @@ concept CContiguous =
       typename std::remove_cvref_t<X>::layout_type;
     };
 
-// Every index of that shape, row-major -- the order the packed buffer is in and
-// the order infer_output_shape assumes.  An odometer rather than a
-// cartesian_product for the reason for_each_offset carries its own.
+// Row-major, which is the order the packed buffer and infer_output_shape
+// assume.  An odometer, for the reason for_each_offset gives.
 template <std::size_t R, typename F>
   requires std::invocable<F &, const std::array<index_t, R> &>
 constexpr void for_each_index(const Shape &shape, F &&fn) noexcept {

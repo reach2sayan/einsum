@@ -15,8 +15,8 @@
 #include <type_traits>
 
 // The operands whose whole Layout is known without an object, which is what
-// lets einsum<"ij,jk->ik">() lower the whole call at compile time: the Geometry
-// is then a constant and the scratch an array.  Value functions, not traits.
+// lets a call lower at compile time: the Geometry is then a constant and the
+// scratch an array.
 namespace einsum::ct {
 
 namespace impl {
@@ -123,10 +123,8 @@ static_assert(
     std::same_as<extents_of_t<Shape{2, 3}>, std::extents<std::size_t, 2, 3>>);
 static_assert(std::same_as<extents_of_t<Shape{}>, std::extents<std::size_t>>);
 
-// The view family's result when the whole lowering is a constant: every extent
-// in the type and a std::array behind it, so the call touches no allocator.
-// The runtime form is an mdarray over dextents and a vector, so a caller moving
-// between the two paths keeps the same indexing.
+// Every extent in the type and a std::array behind it, so the call touches no
+// allocator.  Still an mdarray, so indexing is the same on either path.
 template <einsum::CScalar T, Shape S>
 using static_mdarray_t = std::experimental::mdarray<
     T, extents_of_t<S>, std::layout_right,

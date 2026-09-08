@@ -17,17 +17,15 @@
 #include <ranges>
 #include <span>
 
-// The one call whose arity and ranks are values rather than types -- what a
-// language binding reading shapes off an array object needs, since it cannot
-// reach BasicEinsum::operator(), whose every rank is in a type.  Everything
-// below the operand adaptation is already dynamic, so this is evaluate() with
-// the templates taken out, sharing the object's own lowering cache with it.
+// The one call whose arity and ranks are values rather than types, for a
+// language binding that reads shapes off an array object.  Everything below the
+// operand adaptation is already dynamic, so this is evaluate() with the
+// templates taken out, sharing the object's lowering cache.
 namespace einsum::impl {
 
-// allocate(shape) hands back a contiguous row-major buffer of that shape, the
-// caller's own, called once the lowering says what shape the result is.  The
-// rank is the subscript's rather than any operand's, which is what makes
-// "i,j->ij" reachable here.
+// allocate(shape) hands back the caller's own contiguous row-major buffer, at
+// the rank the subscript implies rather than any operand's -- which is what
+// makes "i,j->ij" reachable here.
 template <typename A, typename T>
 concept CAllocates = requires(A &&allocate, const Shape &shape) {
   { allocate(shape) } -> std::same_as<T *>;
@@ -57,10 +55,8 @@ evaluate_dynamic(const Einsum &e,
                          });
   const std::span<const Layout> spans{lays};
 
-  // The same cache the typed call operator keeps, keyed the same way on the
-  // operand layouts.  The kind is what keeps the two apart: a TensorView is
-  // never a result type, so &result_id<TensorView<T>> is an address no typed
-  // call can produce.
+  // The typed operator's own cache.  A TensorView is never a result type, so
+  // this kind is an address no typed call can produce.
   if (const auto ok = refresh(einsum_access::lowering_of(e), einsum_access::plan_of(e),
                               einsum_access::order_of(e), spans,
                               &result_id<TensorView<T>>,
@@ -74,9 +70,8 @@ evaluate_dynamic(const Einsum &e,
 
   T *const out_data = allocate(lowering.out_shape);
 
-  // No scratch_offsets here: every operand is a strided rectangle the kernels
-  // address where it lies and the output is contiguous, so the block is the
-  // geometry's own working space and nothing else.
+  // No scratch_offsets: nothing is packed and nothing scattered, so the block
+  // is the geometry's own working space.
   const auto elems = static_cast<std::size_t>(lowering.geometry.scratch_elems);
   const std::span block =
       einsum_access::scratch_of(e).bytes(elems * sizeof(T));

@@ -17,11 +17,10 @@
 
 namespace einsum {
 
-// The compile-time half of the entry point: the same object and the same
-// evaluation as the runtime one, but the subscript is a template argument, so
-// every way it can be wrong is a static_assert carrying the sentence the
-// runtime error would have -- and the operand count is a constant, which is
-// what lets this one also take an untagged output.
+// The same object and evaluation as the runtime path, but the subscript is a
+// template argument: every way it can be wrong is a static_assert carrying the
+// sentence the runtime error would have, and the operand count is a constant,
+// which is what lets this one take an untagged output.
 template <impl::FixedString S, path P = path::greedy>
 class StaticEinsum : public Einsum {
   friend struct einsum::impl::einsum_access;
@@ -50,12 +49,9 @@ public:
     return ct::all_static<Ops...>() && sizeof...(Ops) == operand_count();
   }
 
-  // einsum<"ij,jk->ik">(a, b)           -> result<R>, by value
-  // einsum<"ij,jk->ik">(a, b, out)      -> result<void>, moved into out
-  // einsum<"ij,jk->ik">(a, b, out(x))   -> the same, spelled as the runtime
-  //                                        path has to spell it
-  //
-  // out() is accepted too, so a call moves between the paths unrewritten.
+  // (a, b)         -> result<R>
+  // (a, b, out)     -> result<void>, moved into out
+  // (a, b, out(x))  -> the same, spelled as the runtime path must spell it
   template <typename... A> [[nodiscard]] auto operator()(A &&...args) const {
     constexpr std::size_t n = sizeof...(A);
     if constexpr (impl::is_rt_out_form<A...>()) {
@@ -142,9 +138,8 @@ private:
         geometry.scratch_elems, shape, direct);
     static constexpr index_t total = map.total;
 
-    // One plain mappable GEMM, nothing packed and nothing summed first: the
-    // case Eigen can unroll rather than block, which is the whole point of
-    // knowing the extents this early.
+    // One mappable GEMM, nothing packed or summed first: the case Eigen
+    // unrolls rather than blocks.
     static constexpr bool fixed_gemm = [] {
       if (sizeof...(Ops) != 2 || geometry.steps.size() != 1 || !direct) {
         return false;
@@ -222,10 +217,7 @@ private:
   }
 
 public:
-  // Whether this call is the one Eigen can unroll: every extent in a type, one
-  // mappable GEMM step, nothing packed, nothing summed first, and a result the
-  // product writes straight into.  Public so a test asserts it rather than
-  // inferring it from a timing.
+  // Public so a test asserts the unrolled case rather than timing for it.
   template <typename... Ops>
   [[nodiscard]] static consteval bool unrolls() noexcept {
     if constexpr (CSameFamily<Ops...> && lowers_statically<Ops...>()) {
@@ -241,17 +233,15 @@ template <impl::FixedString S, path P = path::greedy>
   return {};
 }
 
-// A function argument is never a constant expression, so the subscript has to
-// reach a template parameter, and only a literal operator template puts it
-// there while still looking like a string.  That is all _ct is: an empty type
-// carrying S, so the two paths differ by a suffix rather than by a syntax.
+// A function argument is never a constant expression, so only a literal
+// operator template gets the subscript into a template parameter while still
+// looking like a string.
 namespace ct {
 
 template <einsum::impl::FixedString S, path P = path::greedy>
 struct Subscript {
-  // "ab,bc,cd->ad"_ct.with<path::sequential>(): the order chosen where the
-  // subscript is written, since it cannot be a second argument for the same
-  // reason the subscript cannot be a first one.
+  // The order chosen where the subscript is written, since it cannot be an
+  // argument for the same reason the subscript cannot.
   template <path Q>
   [[nodiscard]] consteval Subscript<S, Q> with() const noexcept {
     return {};

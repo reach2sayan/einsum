@@ -4,9 +4,8 @@
 
 namespace einsum {
 
-// What a kernel here can multiply and accumulate.  Not std::floating_point:
-// the library works over int too, and over anything answering * and + the way
-// Eigen's coefficient loops expect.
+// What a kernel can multiply and accumulate.  Not std::floating_point: int
+// works, and so does anything answering * and + as Eigen expects.
 template <typename T>
 concept CScalar = std::default_initializable<T> && std::copyable<T> &&
                   requires(const T &a, const T &b) {

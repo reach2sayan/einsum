@@ -17,10 +17,9 @@
 
 namespace einsum {
 
-// The one table: it generates the enumerators, the message strings, and one
-// static_assert per code, so a subscript rejected at compile time reports the
-// sentence a runtime parse would have returned.  A Boost.PP sequence rather
-// than an X-macro, because the compile-time side iterates it in a class body.
+// The one table: enumerators, messages, and one static_assert per code.  A
+// Boost.PP sequence, not an X-macro, because the compile-time side iterates it
+// inside a class body.
 //
 // clang-format off
 #define EINSUM_ERRC_SEQ                                                                          \
@@ -79,13 +78,11 @@ inline constexpr std::array kMessages{
 
 using detail::message;
 
-// The enumerator's own spelling, for a caller printing a code rather than a
-// sentence.  message() is what everything here prints.
+// The enumerator's spelling; message() is what everything here prints.
 [[nodiscard]] inline const char *name(const errc c) noexcept {
   return boost::describe::enum_to_string(c, "?");
 }
 
-// One implementation for both, and the same text std::format prints below.
 // Written out rather than abbreviated: `decltype(e)` of a by-value `const auto`
 // parameter is `const errc`, which never matches `errc`.
 template <typename E>
@@ -100,11 +97,10 @@ template <typename T> using result = std::expected<T, error>;
   return std::unexpected{error{.code = c}};
 }
 
-// The same `std::unexpected` return for results whose value type is a caller's
-// tensor.  GCC's late -Wmaybe-uninitialized pass, at -O3, reads the value arm
-// of the returned expected -- the union member an error return never enters --
-// and reports its bytes as read, blaming the line it is built on.  Confining
-// the pragma here keeps the warning live in the rest of the library.
+// GCC's late -Wmaybe-uninitialized pass, at -O3, reads the value arm of the
+// returned expected -- which an error return never enters -- and blames the
+// line it is built on.  The pragma is confined here to keep the warning live
+// elsewhere.
 template <typename T>
 [[nodiscard]] constexpr result<T> propagate(const error e) noexcept {
 #if defined(__GNUC__) && !defined(__clang__)
@@ -125,9 +121,8 @@ template <typename T>
 
 } // namespace einsum
 
-// One static_assert per error code, from the same table.  `predicate` is a
-// function-like macro taking an enumerator name and yielding a constant
-// expression that is true when that is what went wrong.
+// `predicate` is a function-like macro taking an enumerator name and yielding
+// true when that is what went wrong.
 #define EINSUM_ERRC_ASSERT_ONE(r, predicate, elem)                             \
   static_assert(!predicate(BOOST_PP_TUPLE_ELEM(0, elem)),                      \
                 "einsum<\"...\">: " BOOST_PP_TUPLE_ELEM(1, elem));

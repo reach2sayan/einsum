@@ -17,9 +17,8 @@ namespace einsum {
 // Where a term's '...' sits among its written labels, or this when it has none.
 inline constexpr std::uint8_t kNoEllipsis = 255;
 
-// What a subscript says, before any operand has been looked at.  The same
-// struct comes out of the constexpr parser below and out of the Boost.Parser
-// one in src/rt/parse.cpp; tests/tests_parse.cpp checks that they agree.
+// What a subscript says, before any operand is looked at.  Both parsers build
+// one; tests/tests_parse.cpp checks that they agree.
 struct Subscripts {
   impl::FixedVec<Labels, kMaxOperands> operands{};
   impl::FixedVec<std::uint8_t, kMaxOperands> ellipsis_at{};
@@ -37,9 +36,9 @@ namespace impl {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-// How often each label appears, saturating at two.  once_per_operand counts a
-// repeat inside one operand once, which is what "does anybody else have this
-// label" means; every occurrence is what an implicit output needs.
+// How often each label appears, saturating at two.  once_per_operand answers
+// "does anybody else have this label"; every occurrence is what an implicit
+// output needs.
 [[nodiscard]] constexpr LabelTable<std::uint8_t>
 count_labels(const FixedVec<Labels, kMaxOperands> &operands,
              const bool once_per_operand) noexcept {
@@ -58,10 +57,9 @@ count_labels(const FixedVec<Labels, kMaxOperands> &operands,
   return counts;
 }
 
-// NumPy's implicit output: the labels occurring exactly once across the whole
-// input, in ascending character order -- so "ba" infers "->ab".  kLabelChars,
-// not the table's slot order, because 'Z' sorts before 'a'.  A longer run than
-// kMaxRank cannot happen and would truncate.
+// NumPy's implicit output: the labels occurring exactly once, in ascending
+// character order, so "ba" infers "->ab".  kLabelChars, not the table's slot
+// order, because 'Z' sorts before 'a'.
 [[nodiscard]] constexpr Labels
 implicit_output(const FixedVec<Labels, kMaxOperands> &operands) noexcept {
   const LabelTable<std::uint8_t> seen = count_labels(operands, false);
@@ -98,8 +96,7 @@ validate_output(const Subscripts &subs) noexcept {
   return {};
 }
 
-// The last step of either parser: an explicit output is checked, an absent one
-// is inferred.
+// Either parser's last step.
 [[nodiscard]] constexpr result<Subscripts>
 finish_subscripts(Subscripts subs) noexcept {
   if (subs.operands.empty()) {
@@ -107,8 +104,8 @@ finish_subscripts(Subscripts subs) noexcept {
   }
   if (!subs.explicit_output) {
     subs.output = implicit_output(subs.operands);
-    // NumPy's rule: the broadcast axes lead, then the once-labels.  How many
-    // there are is not known until the operands arrive.
+    // NumPy's rule: broadcast axes lead, and how many is not known until the
+    // operands arrive.
     if (std::ranges::any_of(subs.ellipsis_at, [](const std::uint8_t at) {
           return at != kNoEllipsis;
         })) {
@@ -130,8 +127,7 @@ parse_subscripts(const std::string_view source) noexcept {
   std::uint8_t current_ellipsis = kNoEllipsis;
   bool in_output = false;
 
-  // A term's labels and its '...' position are stored together, which is what
-  // keeps the two vectors the same length.
+  // Stored together, which is what keeps the two vectors the same length.
   const auto close_term = [&]() noexcept {
     const bool ok = subs.operands.try_push_back(current) &&
                     subs.ellipsis_at.try_push_back(current_ellipsis);
@@ -207,11 +203,9 @@ parse_subscripts(const std::string_view source) noexcept {
   return finish_subscripts(subs);
 }
 
-// Every '...' becomes as many synthetic labels as the operand ranks say it
-// stands for, after which nothing downstream knows an ellipsis was there.  The
-// dimensions are right-aligned as NumPy aligns them: an operand covering fewer
-// of them takes the LAST of the broadcast labels, so (3, 4) and (5, 3, 4) meet
-// on their trailing axes.
+// Every '...' becomes as many synthetic labels as the ranks say, after which
+// nothing downstream knows of ellipses.  Right-aligned as NumPy aligns them: an
+// operand covering fewer takes the LAST of the broadcast labels.
 [[nodiscard]] constexpr result<Subscripts>
 expand(const Subscripts &subs,
        const std::span<const std::uint8_t> ranks) noexcept {
@@ -285,8 +279,8 @@ expand(const Subscripts &subs,
 
 namespace ct {
 
-// The subscript of einsum<S>, and one static_assert per error code so a bad one
-// reports the sentence rather than the instantiation.
+// One static_assert per error code, so a bad subscript reports the sentence
+// rather than the instantiation.
 template <impl::FixedString S> struct subscripts {
   static constexpr auto parsed = impl::parse_subscripts(S.view());
 

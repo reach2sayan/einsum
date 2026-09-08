@@ -1,11 +1,7 @@
 #pragma once
 
-// The header-only part of the library: the compile-time entry point
-// einsum<"ij,jk->ik">(), the object it answers, the views, the lowering and the
-// kernels.
-//
-// einsum(std::string_view), which parses a subscript that is not known until
-// run time, lives in <einsum/rt/parse.hpp> and needs libeinsum_rt linked.
+// The header-only part of the library.  einsum(std::string_view) lives in
+// <einsum/rt/parse.hpp> and needs libeinsum_rt linked.
 #include "einsum/core/einsum_object.hpp"
 #include "einsum/core/execute.hpp"
 #include "einsum/core/kernels.hpp"

@@ -7,9 +7,8 @@
 
 namespace einsum::impl {
 
-// A string usable as a non-type template parameter, which is what turns
-// einsum<"ij,jk->ik">(a, b) into a type the compiler can parse the subscript
-// out of.  Structural, so `data` must be public and there can be nothing else.
+// A string usable as a non-type template parameter.  Structural, so `data` must
+// be public and there can be nothing else.
 template <std::size_t N> struct FixedString {
   static_assert(N > 0, "FixedString: N counts the terminating NUL, so N >= 1");
 
@@ -52,8 +51,7 @@ static_assert(CIsExactlyItsChars<FixedString<1>>,
 static_assert(CIsExactlyItsChars<FixedString<2>>, "see above");
 static_assert(CIsExactlyItsChars<FixedString<8>>, "see above");
 
-// Two spellings of the same subscript must name the same specialisation, and
-// two different ones must not.  That is the whole contract einsum<S> rests on.
+// The contract einsum<S> rests on: one subscript, one specialisation.
 template <FixedString S> struct nttp_probe {
   static constexpr auto label = S;
 };

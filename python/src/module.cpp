@@ -26,14 +26,12 @@
 namespace einsum::py {
 namespace {
 
-// The exception type Python sees.  Deliberately leaked: it is a type object
-// that lives as long as the module, and a translator is a plain function
-// pointer, so it cannot capture.
+// Deliberately leaked: it lives as long as the module, and a translator is a
+// plain function pointer that cannot capture.
 pyb::handle error_class;
 
-// A Subscripts back as the string it was parsed from.  There is no formatter for
-// one in the library -- nothing in C++ asks -- and Einsum.subscripts has to
-// answer something a caller can pass to einsum() again.
+// Back as the string it was parsed from, which is what Einsum.subscripts has to
+// answer.  Nothing in C++ asks, so the library has no formatter for one.
 [[nodiscard]] std::string render(const Subscripts &subs) {
   const auto term = [](const Labels &labels, const std::uint8_t ellipsis_at) {
     std::string out;
@@ -64,9 +62,7 @@ pyb::handle error_class;
   return out;
 }
 
-// One call, in one scalar.  Every operand is converted (which for a matching
-// dtype is no copy), the result is allocated at the shape the lowering chooses,
-// and the contraction is written straight into it.
+// One call in one scalar, written straight into the result.
 template <typename T>
 [[nodiscard]] pyb::object contract(const Einsum &self, const pyb::args &operands) {
   if (operands.size() > kMaxOperands) {
@@ -101,13 +97,11 @@ PYBIND11_MODULE(_einsum, m) {
             "object it answers.  Import einsum instead.";
   m.attr("__version__") = EINSUM_VERSION_STRING;
 
-  // Both are the width of a std::array in every constexpr structure in the
-  // library, so they are what a plan costs whether or not a subscript uses them.
+  // What a plan costs whether or not a subscript uses them.
   m.attr("MAX_RANK") = ei::kMaxRank;
   m.attr("MAX_OPERANDS") = ei::kMaxOperands;
 
-  // The class first, then a translator that puts the code on the instance --
-  // register_exception would install one carrying only the message.
+  // A translator, not register_exception: the code goes on the instance.
   ep::error_class =
       pyb::exception<ep::PyError>(m, "Error", PyExc_ValueError).release();
   pyb::register_exception_translator([](std::exception_ptr p) {
@@ -122,8 +116,7 @@ PYBIND11_MODULE(_einsum, m) {
     }
   });
 
-  // Generated from the one table that defines them, so a code added to
-  // EINSUM_ERRC_SEQ appears here -- with its sentence -- and nothing is edited.
+  // From the one table, so a code added to EINSUM_ERRC_SEQ appears here.
   pyb::native_enum<ei::errc> errors(m, "errc", "enum.IntEnum",
                                     "Why einsum refused; Error.code carries one.");
 #define EINSUM_PY_ERRC(r, unused, elem)                                        \
@@ -142,23 +135,14 @@ PYBIND11_MODULE(_einsum, m) {
              "The subscript's own order, left to right, verbatim.")
       .finalize();
 
-  // Registered before the functions that answer one: pybind11 writes a
-  // signature from the types it already knows, and a class registered after
-  // its factory shows up in the docstring -- and so in the stub -- as the raw
-  // C++ spelling.
-  // No init: the only way to one is einsum(), which is where a bad subscript is
-  // refused.  A copy would be independent but starts cold, and there is nothing
-  // a caller gains by making one.
+  // Registered before the functions answering one, or pybind11 writes the raw
+  // C++ spelling into their signatures.  No init: einsum() is the only way to
+  // one, and it is where a bad subscript is refused.
   pyb::class_<ei::Einsum>(m, "Einsum",
                           "A parsed subscript.  Call it with arrays.")
-      // One instantiation per scalar and no more: float32 throughout is a
-      // float32 call, and anything else is a double one -- NumPy's own
-      // promotion, and the two dtypes Eigen's GEMM runs.
-      //
-      // The GIL is held for the whole of it, deliberately.  A call grows the
-      // object's scratch and rewrites its lowering cache, so two threads inside
-      // one Einsum would race; serialising on the GIL is what makes sharing one
-      // safe.  A copy starts cold, so a caller wanting real parallelism copies.
+      // The GIL is held throughout, deliberately: a call rewrites the object's
+      // scratch and lowering cache, so two threads in one Einsum would race.
+      // A caller wanting parallelism copies the object.
       .def(
           "__call__",
           [](const ei::Einsum &self, const pyb::args &operands) {

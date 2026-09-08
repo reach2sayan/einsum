@@ -15,32 +15,27 @@
 #include <cstddef>
 #include <ranges>
 #include <string>
+#include <vector>
 
-// NumPy arrays as einsum operands.
-//
-// An impl::Layout is extents and signed strides in elements, which is what a
-// NumPy array is -- so a C-ordered, F-ordered, sliced, transposed or reversed
-// array is handed to the kernels where it already lies, and only a dtype this
-// module does not run in gets copied.  That the strides are signed is why the
-// reversed case works at all; the library made them ptrdiff_t for exactly it.
+// NumPy arrays as einsum operands.  A Layout is extents and signed strides in
+// elements, which is what a NumPy array is, so a sliced, transposed or reversed
+// array goes to the kernels where it lies; only a foreign dtype is copied.
 namespace einsum::py {
 
 namespace pyb = pybind11;
 
-// The two scalars the module runs in.  Both go through Eigen's GEMM; anything
-// else a caller passes is converted to double on the way in, which is what
-// NumPy's own promotion would have done.
+// The two scalars Eigen's GEMM runs; anything else is converted to double, as
+// NumPy's own promotion would.
 enum class dtype : bool { f64, f32 };
 
-// One operand, held for the length of a call: the array pybind11 owns (which is
-// the caller's own when nothing had to be converted) and the view into it.
+// Held for the length of a call: the array pybind11 owns and the view into
+// it.
 template <typename T> struct Operand {
   pyb::array_t<T> array;
   impl::TensorView<const T> view;
 };
 
-// Every operand's dtype, promoted the way NumPy promotes: float32 throughout is
-// a float32 call, and anything else is a double one.
+// float32 throughout is a float32 call; anything else is a double one.
 [[nodiscard]] inline dtype promote(const pyb::args &operands) {
   const auto f32 = pyb::dtype::of<float>();
   return std::ranges::all_of(operands,
@@ -54,10 +49,9 @@ template <typename T> struct Operand {
              : dtype::f64;
 }
 
-// An axis of extent > 1 whose stride is 0 is a broadcast view -- np.broadcast_to
-// and what an np.newaxis expansion leaves behind.  It is not a strided
-// rectangle: collapse() reasons about strides that nest, and a repeated element
-// nests with nothing.  Such an operand is materialised, and only such an one.
+// An axis of extent > 1 with stride 0 is a broadcast view (np.broadcast_to),
+// not a strided rectangle: a repeated element nests with nothing.  Only such an
+// operand is materialised.
 template <typename T>
 [[nodiscard]] bool needs_packing(const pyb::array_t<T> &array) noexcept {
   const auto axes = std::views::iota(pyb::ssize_t{0}, array.ndim());
@@ -66,8 +60,8 @@ template <typename T>
   });
 }
 
-// forcecast, and not c_style with it: a cast copies, and an array whose dtype
-// already matches must not.  Its strides are what the call is going to use.
+// forcecast without c_style: an array whose dtype already matches must not be
+// copied, and its strides are what the call uses.
 template <typename T>
 [[nodiscard]] Operand<T> as_operand(const pyb::handle source) {
   auto array = pyb::array_t<T, pyb::array::forcecast>::ensure(source);
@@ -83,28 +77,29 @@ template <typename T>
     fail_with(errc::rank_too_high);
   }
 
-  impl::Layout layout;
   const auto itemsize = array.itemsize();
-  for (const auto axis : std::views::iota(pyb::ssize_t{0}, array.ndim())) {
-    layout.shape.push_back(static_cast<index_t>(array.shape(axis)));
-    // NumPy counts strides in bytes and einsum counts them in elements.
-    layout.strides.push_back(
-        static_cast<index_t>(array.strides(axis) / itemsize));
-  }
+  const auto axes = std::views::iota(pyb::ssize_t{0}, array.ndim());
+  // NumPy counts strides in bytes and einsum counts them in elements.
+  const impl::Layout layout{
+      .shape = {std::from_range,
+                axes | std::views::transform([&](const pyb::ssize_t axis) {
+                  return static_cast<index_t>(array.shape(axis));
+                })},
+      .strides = {std::from_range,
+                  axes | std::views::transform([&](const pyb::ssize_t axis) {
+                    return static_cast<index_t>(array.strides(axis) / itemsize);
+                  })}};
   const T *const data = array.data();
   return {std::move(array), impl::TensorView<const T>{data, layout}};
 }
 
-// The result: allocated at the shape the lowering chose, which is the rank the
-// *subscript* implies rather than any operand's.  That is the whole of what the
-// dynamic entry buys, and it is why "i,j->ij" is an array here and not an error.
+// At the shape the lowering chose -- the rank the subscript implies, not any
+// operand's -- which is why "i,j->ij" is an array here and not an error.
 template <typename T> [[nodiscard]] pyb::array_t<T> empty_like(const Shape &shape) {
-  std::vector<pyb::ssize_t> extents;
-  extents.reserve(shape.size());
-  std::ranges::transform(shape, std::back_inserter(extents),
-                         [](const index_t e) {
-                           return static_cast<pyb::ssize_t>(e);
-                         });
+  const std::vector<pyb::ssize_t> extents{
+      std::from_range,
+      shape | std::views::transform(
+                  [](const index_t e) { return static_cast<pyb::ssize_t>(e); })};
   return pyb::array_t<T>{extents};
 }
 

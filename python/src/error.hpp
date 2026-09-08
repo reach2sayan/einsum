@@ -7,16 +7,13 @@
 #include <string>
 #include <type_traits>
 
-// libeinsum is compiled -fno-exceptions and every refusal travels as a
-// result<T>.  This TU cannot be: pybind11's own error_already_set is a C++
-// exception, and every conversion below can raise one.  No throw crosses a
-// -fno-exceptions frame -- the library never calls back into Python, so the
-// only frames a throw here unwinds are this file's.
+// libeinsum is -fno-exceptions and every refusal travels as a result<T>; this
+// TU cannot be, since pybind11 raises.  No throw crosses a -fno-exceptions
+// frame: the library never calls back into Python.
 namespace einsum::py {
 
-// Inherits einsum::error rather than restating it: the code *is* that type, and
-// the message is whatever its own formatter says, so a code added to
-// EINSUM_ERRC_SEQ needs nothing here.
+// Inherits einsum::error, so a code added to EINSUM_ERRC_SEQ needs nothing
+// here.
 struct PyError : error, std::runtime_error {
   explicit PyError(const error e)
       : error{e}, std::runtime_error{std::format("{}", e)} {}
