@@ -127,8 +127,7 @@ set(EINSUM_BOOST_HEADER_DIRS
         boost/preprocessor/tuple/limits
         boost/preprocessor/variadic
         boost/preprocessor/variadic/detail
-        boost/preprocessor/variadic/limits
-        boost/stl_interfaces)
+        boost/preprocessor/variadic/limits)
 
 set(EINSUM_EIGEN_HEADER_DIRS
         Eigen
