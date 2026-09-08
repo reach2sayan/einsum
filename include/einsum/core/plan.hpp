@@ -8,39 +8,34 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <iterator>
 #include <ranges>
 #include <string_view>
 
 namespace einsum {
 
-// What one operand needs before it can take part in a contraction: its repeated
-// labels merged onto a diagonal, and the labels nobody else will ever see
-// summed away.  Both are cheaper here than inside the GEMM loop, and both are
-// what make the step classification below total.
+// What one operand does to itself before contracting: repeated labels merged
+// onto a diagonal, private labels summed away.  Both are cheaper here than
+// inside the GEMM loop.
 struct Prep {
-  // The merged axes, one per distinct label, first occurrence order.
-  Labels merged_labels{};
+  Labels merged_labels{}; // one per distinct label, first occurrence order
   // Per original axis, which merged axis it folds into.  Two axes sharing one
-  // means a diagonal, and the merged stride is the sum of theirs.
+  // means a diagonal, whose stride is the sum of theirs.
   impl::FixedVec<std::uint8_t, kMaxRank> merged_into{};
-  // Merged labels no other operand has and the output does not want.
-  Labels reduce{};
-  // merged_labels minus reduce: what the steps actually see.
-  Labels labels_after{};
+  Labels reduce{};       // merged labels no other operand has and the output does not want
+  Labels labels_after{}; // merged_labels minus reduce: what the steps see
 
   [[nodiscard]] friend constexpr bool
   operator==(const Prep &, const Prep &) noexcept = default;
 };
 
-// One binary contraction, named by which labels play which role in it.  batch
-// is the pair of axes GEMM iterates over, m/n are the free axes of the two
-// sides, k is what is summed.  Nothing here mentions an extent: a Plan is the
-// shape of the computation, not of the data.
-// Where a step's two sides come from: an operand by index, or the result of an
-// earlier step, which is kIntermediate plus that step's index.  A path chosen
-// by cost does not contract left to right, so a step has to say.
+// Where a step's side comes from: an operand by index, or an earlier step's
+// result, which is this plus that step's index.
 inline constexpr std::uint8_t kIntermediate = kMaxOperands;
 
+// One binary contraction, named by which labels play which role in it.  batch
+// is the pair of axes GEMM iterates over, m/n are the free axes of the two
+// sides, k is what is summed.  Nothing here mentions an extent.
 struct Step {
   Labels batch{};
   Labels m{};
@@ -55,13 +50,11 @@ struct Step {
   operator==(const Step &, const Step &) noexcept = default;
 };
 
-// What each label is bound to, and whether anything has bound it yet.  Here
-// rather than in the lowering because a path policy is chosen on extents and
-// must be able to read them.
+// What each label is bound to.  Here rather than in the lowering because a path
+// policy is chosen on extents and must be able to read them.
 struct BoundExtent {
   index_t extent = 0;
   bool known = false;
-  bool broadcast = false;
 
   [[nodiscard]] friend constexpr bool
   operator==(const BoundExtent &, const BoundExtent &) noexcept = default;
@@ -74,9 +67,7 @@ class Plan;
 namespace impl {
 [[nodiscard]] constexpr result<Plan> make_plan(const Subscripts &) noexcept;
 
-// The one way the lowering reads a Plan's internals.  A friend struct rather
-// than a public accessor per member: preps and steps are what make_geometry
-// walks and are no part of what a caller of einsum() ever asks about.
+// The one way the lowering reads a Plan's internals.
 struct access;
 } // namespace impl
 
@@ -130,29 +121,24 @@ make_prep(const Labels &operand, const Labels &output,
       return fail(errc::rank_too_high);
     }
   }
-  for (const char c : prep.merged_labels) {
-    const bool nobody_else = counts[c] == 1;
-    if (nobody_else && !std::ranges::contains(output, c)) {
-      prep.reduce.push_back(c);
-    } else {
-      prep.labels_after.push_back(c);
-    }
-  }
+  std::ranges::partition_copy(
+      prep.merged_labels, std::back_inserter(prep.reduce),
+      std::back_inserter(prep.labels_after), [&](const char c) {
+        return counts[c] == 1 && !std::ranges::contains(output, c);
+      });
   return prep;
 }
 
 // The subscript and what each operand must do to itself before it can take part
 // -- the diagonals it walks and the axes it sums away.  In what ORDER the
-// operands are then contracted is not decided here: that depends on their
-// extents, which a Plan has never seen, so it belongs to the per-call lowering
-// and to the path policy that drives it.
+// operands are then contracted depends on their extents, which a Plan has never
+// seen, so it belongs to the per-call lowering.
 [[nodiscard]] constexpr result<Plan>
 make_plan(const Subscripts &subs) noexcept {
   Plan plan;
   plan.subs_ = subs;
 
-  // Once per operand: "ii" is one occurrence of i and a diagonal, not two
-  // occurrences and a contraction.
+  // Once per operand: "ii" is one occurrence of i and a diagonal.
   const auto counts = count_labels(subs.operands, true);
   for (const Labels &op : subs.operands) {
     const auto prep = make_prep(op, subs.output, counts);
@@ -165,9 +151,7 @@ make_plan(const Subscripts &subs) noexcept {
   return plan;
 }
 
-// parse -> plan, as one pipeline both front ends run.  ct::subscripts<S> calls
-// it in a constant expression and rt::plan() calls it after Boost.Parser has
-// produced the same Subscripts, so the two paths differ only in the parser.
+// parse -> plan, as one pipeline both front ends run.
 [[nodiscard]] constexpr result<Plan>
 build_plan(const std::string_view source) noexcept {
   return parse_subscripts(source).and_then(make_plan);

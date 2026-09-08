@@ -14,17 +14,12 @@
 #include <span>
 
 // Where a Plan meets a set of extents and becomes a sequence of Eigen calls.
-// Everything here is constexpr, so the compile-time entry point runs exactly
-// the same lowering the runtime one does -- the two paths differ only in when.
+// Constexpr throughout, so both entry points run the one lowering.
 namespace einsum::impl {
 
-// An ordered run of axes of one operand -- the m of a GEMM, its k, the batch it
-// iterates -- is extents and strides and nothing else, which is a Layout.  The
-// question below is asked about one.
-//
-// A group is one axis in disguise when its strides nest exactly: dropping the
-// extent-1 axes, each stride has to be the next one times the next extent.
-// That is the whole test for whether Eigen can address it without a copy.
+// A run of axes is one axis in disguise when its strides nest exactly: dropping
+// the extent-1 axes, each stride is the next one times the next extent.  That
+// is the whole test for whether Eigen can address it without a copy.
 struct Collapsed {
   bool ok = false;
   index_t extent = 1;
@@ -32,33 +27,29 @@ struct Collapsed {
 };
 
 [[nodiscard]] constexpr Collapsed collapse(const Layout &g) noexcept {
-  Shape ext;
-  Shape str;
-  for (const auto i : std::views::iota(std::size_t{0}, g.rank())) {
-    // An extent-1 axis is addressed at one offset only, so its stride never
-    // moves anything and cannot break the nesting.
-    if (g.shape[i] != 1) {
-      ext.push_back(g.shape[i]);
-      str.push_back(g.strides[i]);
-    }
-  }
+  // An extent-1 axis moves nothing, so its stride cannot break the nesting.
+  auto live = std::views::zip(g.shape, g.strides) |
+              std::views::filter(
+                  [](const auto &axis) { return std::get<0>(axis) != 1; });
+  const Shape ext{std::from_range, live | std::views::keys};
+  const Shape str{std::from_range, live | std::views::values};
   if (ext.empty()) {
     return {.ok = true, .extent = 1, .stride = 1};
   }
-  const auto pairs = std::views::iota(std::size_t{0}, ext.size() - 1);
-  if (std::ranges::any_of(pairs, [&](const std::size_t i) {
-        return str[i] != str[i + 1] * ext[i + 1];
-      })) {
-    return {};
-  }
-  return {.ok = true, .extent = product(ext), .stride = str.back()};
+  const auto nested = std::views::zip(ext, str);
+  const bool broken =
+      std::ranges::adjacent_find(nested, [](const auto &in, const auto &out) {
+        return std::get<1>(in) != std::get<1>(out) * std::get<0>(out);
+      }) != std::ranges::end(nested);
+  return broken ? Collapsed{}
+                : Collapsed{
+                      .ok = true, .extent = product(ext), .stride = str.back()};
 }
 
 // One matrix operand of one GEMM: two collapsible groups Eigen can Map, or a
-// rectangle that has to be packed into scratch first.  transposed means the map
-// is cols x rows and .transpose() puts it back -- which is how a column-major
-// block reaches a row-major Map with its inner stride still 1, and an inner
-// stride of 1 is the only thing that keeps Eigen from allocating a temporary.
+// rectangle to be packed into scratch first.  transposed means the map is
+// cols x rows, which is how a column-major block reaches a Map with its inner
+// stride still 1 -- the one thing keeping Eigen from a temporary.
 struct Slab {
   Layout batch{};
   Layout rows{};
@@ -68,9 +59,7 @@ struct Slab {
   index_t outer_stride = 1;
   index_t pack_offset = 0; // into the workspace, when !mappable
 
-  // The two extents Eigen is handed.  Derived rather than stored: they are the
-  // sizes of the layouts right above them, and a copy of a number is one more
-  // thing that can disagree with what it copied.
+  // Derived rather than stored: a copy can disagree with what it copied.
   [[nodiscard]] constexpr index_t rows_n() const noexcept {
     return rows.size();
   }
@@ -88,8 +77,8 @@ struct Slab {
   const Collapsed r = collapse(rows);
   const Collapsed c = collapse(cols);
   if (r.ok && c.ok) {
-    // A degenerate side has no stride worth honouring, so the other one's
-    // becomes the outer stride and the map is exact either way.
+    // A degenerate side has no stride worth honouring, so the other one's is
+    // the outer stride.
     if (c.stride == 1 || cols_n == 1) {
       const index_t outer = rows_n == 1 ? cols_n : r.stride;
       // Rows that overlap are not a matrix, and a reversed axis is not an
@@ -111,7 +100,6 @@ struct Slab {
   return slab;
 }
 
-// Whether a step's result is the caller's output or a tensor this library made.
 struct PrepGeom {
   Layout merged{}; // over Prep::merged_labels, addressing the operand itself
   Layout keep{};   // the merged axes that survive
@@ -128,10 +116,7 @@ struct StepGeom {
   Slab r{};
   Slab out{};
 
-  // The GEMM's four extents, read off the slabs that already carry them: the
-  // left slab is batch x m x k and the right one batch x k x n, so storing m,
-  // n, k and the batch count again would only be four more things to keep in
-  // step with the layouts they came from.
+  // The left slab is batch x m x k, the right one batch x k x n.
   [[nodiscard]] constexpr index_t m() const noexcept { return l.rows_n(); }
   [[nodiscard]] constexpr index_t n() const noexcept { return r.cols_n(); }
   [[nodiscard]] constexpr index_t k() const noexcept { return l.cols_n(); }
@@ -143,8 +128,8 @@ struct StepGeom {
     return m() == 1 && n() == 1 && k() == 1;
   }
 
-  // Where the three operands' memory is.  A scratch base is an offset into the
-  // workspace; otherwise it is the operand's own pointer.
+  // A scratch base is an offset into the workspace, otherwise the operand's
+  // own pointer.
   bool l_scratch = false;
   std::uint8_t l_operand = 0;
   index_t l_offset = 0;
@@ -158,12 +143,9 @@ struct StepGeom {
 struct Geometry {
   FixedVec<PrepGeom, kMaxOperands> preps{};
   FixedVec<StepGeom, kMaxOperands - 1> steps{};
-  // The order the steps were chosen in.  Kept because it is what a test asks
-  // about; nothing in the execution reads it, since every step already says
-  // where its two sides are.
+  // For the tests; every step already says where its two sides are.
   Path path{};
   Shape out_shape{};
-  index_t out_size = 1;
   index_t scratch_elems = 0;
 
   // The one-operand path: no GEMM, just a strided copy into the output.
@@ -172,7 +154,7 @@ struct Geometry {
   index_t unary_offset = 0;
 };
 
-// --- extent binding ----------------------------------------------------------
+// The extents each label is bound to, in operand order.
 [[nodiscard]] constexpr result<BoundExtents>
 bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
   if (inputs.size() != plan.operand_count()) {
@@ -184,11 +166,8 @@ bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
     if (input.rank() != labels.size()) {
       return fail(errc::rank_mismatch);
     }
-    // A label repeated inside one operand walks a diagonal, and a diagonal has
-    // to be square: only labels meeting ACROSS operands may broadcast.
-    // What THIS operand's axes say, which is a different question from what the
-    // label is bound to across operands: a diagonal has to be square in the
-    // operand that walks it, even where that same label broadcasts elsewhere.
+    // What THIS operand's axes say: a diagonal has to be square in the operand
+    // that walks it, even where the same label broadcasts elsewhere.
     LabelTable<bool> seen_here;
     LabelTable<index_t> extent_here;
     for (const auto &[c, extent] : std::views::zip(labels, input.shape)) {
@@ -203,16 +182,13 @@ bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
       extent_here[c] = extent;
 
       if (!slot.known) {
-        slot = {.extent = extent, .known = true, .broadcast = false};
-      } else if (slot.extent == extent) {
-        // agreed
-      } else if (extent == 1) {
-        // This operand is stretched along the axis; the extent stands.
-        slot.broadcast = true;
+        slot = {.extent = extent, .known = true};
+      } else if (slot.extent == extent || extent == 1) {
+        // Agreed, or this operand is stretched along the axis and what is
+        // already bound stands.
       } else if (slot.extent == 1) {
         // Everything so far was stretched; this operand sets the extent.
         slot.extent = extent;
-        slot.broadcast = true;
       } else {
         return fail(is_broadcast_label(c) ? errc::broadcast_mismatch
                                           : errc::extent_conflict);
@@ -222,34 +198,46 @@ bind_extents(const Plan &plan, const std::span<const Layout> inputs) noexcept {
   return bound;
 }
 
+// The ranks an expand() is told about.
+[[nodiscard]] constexpr FixedVec<std::uint8_t, kMaxOperands>
+ranks_of(const std::span<const Layout> lays) noexcept {
+  return {std::from_range, lays | std::views::transform([](const Layout &lay) {
+            return static_cast<std::uint8_t>(lay.rank());
+          })};
+}
+
+[[nodiscard]] constexpr Shape shape_over(const Labels &labels,
+                                         const BoundExtents &bound) noexcept {
+  return {std::from_range, labels | std::views::transform([&](const char c) {
+                             return bound[c].extent;
+                           })};
+}
+
 [[nodiscard]] constexpr result<Shape>
 infer_output_shape(const Plan &plan,
                    const std::span<const Layout> inputs) noexcept {
-  const auto bound = bind_extents(plan, inputs);
-  if (!bound) {
-    return std::unexpected{bound.error()};
-  }
-  Shape shape;
-  for (const char c : plan.output_labels()) {
-    shape.push_back((*bound)[c].extent);
-  }
-  return shape;
+  return bind_extents(plan, inputs).transform([&](const BoundExtents &bound) {
+    return shape_over(plan.output_labels(), bound);
+  });
 }
 
-// --- lowering ----------------------------------------------------------------
 namespace detail {
 
-// The axes of `labels` inside `layout`, whose axis i carries `axis_labels[i]`.
+// The axes of `wanted` inside `layout`, whose axis i carries `axis_labels[i]`.
 [[nodiscard]] constexpr Layout pick(const Labels &axis_labels,
                                     const Layout &layout,
                                     const Labels &wanted) noexcept {
-  Layout picked;
-  for (const char c : wanted) {
-    const std::size_t a = index_of(axis_labels, c);
-    picked.shape.push_back(layout.shape[a]);
-    picked.strides.push_back(layout.strides[a]);
-  }
-  return picked;
+  const auto axes = wanted | std::views::transform([&](const char c) {
+                      return index_of(axis_labels, c);
+                    });
+  return {.shape = {std::from_range,
+                    axes | std::views::transform([&](const std::size_t a) {
+                      return layout.shape[a];
+                    })},
+          .strides = {std::from_range,
+                      axes | std::views::transform([&](const std::size_t a) {
+                        return layout.strides[a];
+                      })}};
 }
 
 // A running bump allocator over the workspace, each block starting on a
@@ -274,36 +262,27 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
   }
 
   Geometry geom;
-  for (const char c : plan.output_labels()) {
-    geom.out_shape.push_back((*bound)[c].extent);
-  }
-  geom.out_size = product(geom.out_shape);
-  if (out.rank() != geom.out_shape.size() ||
-      !std::equal(out.shape.begin(), out.shape.end(), geom.out_shape.begin())) {
+  geom.out_shape = shape_over(plan.output_labels(), *bound);
+  if (!std::ranges::equal(out.shape, geom.out_shape)) {
     return fail(errc::output_mismatch);
   }
 
   detail::Bump bump;
 
   // --- the per-operand preparation -------------------------------------------
-  std::size_t oi = 0;
-  for (const auto &[input, prep] :
-       std::views::zip(inputs, access::preps(plan))) {
+  for (const auto &[input, prep, op_labels] : std::views::zip(
+           inputs, access::preps(plan), plan.subscripts().operands)) {
     PrepGeom pg;
 
     // A label repeated inside one operand walks the diagonal, and the stride
     // along a diagonal is the sum of the strides of the axes it crosses.
-    for (const char c : prep.merged_labels) {
-      pg.merged.shape.push_back((*bound)[c].extent);
-      pg.merged.strides.push_back(0);
-    }
+    pg.merged.shape = shape_over(prep.merged_labels, *bound);
+    pg.merged.strides = Shape(prep.merged_labels.size());
     // A stretched axis contributes no stride: every index along it reads the
-    // one element the operand actually has.  collapse() already refuses a run
-    // whose stride is zero, so such an operand takes the packing path and no
-    // kernel has to know that broadcasting exists.
-    for (const auto &[c, extent, stride, into] :
-         std::views::zip(plan.subscripts().operands[oi], input.shape,
-                         input.strides, prep.merged_into)) {
+    // one element there is.  collapse() refuses a zero stride, so such an
+    // operand takes the packing path and no kernel knows of broadcasting.
+    for (const auto &[c, extent, stride, into] : std::views::zip(
+             op_labels, input.shape, input.strides, prep.merged_into)) {
       const bool stretched = extent == 1 && (*bound)[c].extent != 1;
       pg.merged.strides[into] += stretched ? index_t{0} : stride;
     }
@@ -324,26 +303,22 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
       pg.after = pg.merged;
     }
     geom.preps.push_back(pg);
-    ++oi;
   }
 
-  // --- the one-operand path --------------------------------------------------
-  // No GEMM to lower: what is left after the diagonal and the sum is a
-  // permutation of the output, so the whole plan is one strided copy.
+  // What is left after the diagonal and the sum is a permutation of the output,
+  // so the whole plan is one strided copy.
   if (plan.operand_count() == 1) {
-    const Labels &after_labels = access::preps(plan)[0].labels_after;
-    const Layout &after = geom.preps[0].after;
-    geom.unary_src = detail::pick(after_labels, after, plan.output_labels());
+    geom.unary_src = detail::pick(access::preps(plan)[0].labels_after,
+                                  geom.preps[0].after, plan.output_labels());
     geom.unary_from_scratch = geom.preps[0].reduced;
     geom.unary_offset = geom.preps[0].reduced_offset;
     geom.scratch_elems = bump.cursor;
     return geom;
   }
 
-  // --- the steps -------------------------------------------------------------
-  // Where each live tensor is: the operands first, then one slot per step for
-  // the intermediate it produces.  A path chosen by cost does not contract left
-  // to right, so a step's sides are looked up rather than carried along.
+  // Where each live tensor is: the operands, then one slot per step for the
+  // intermediate it produces.  A cost-chosen path does not contract left to
+  // right, so a step's sides are looked up rather than carried along.
   struct Source {
     Labels labels{};
     Layout layout{};
@@ -352,18 +327,17 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
     std::uint8_t operand = 0;
   };
   std::array<Source, 2 * kMaxOperands> sources{};
-  for (const auto i : std::views::iota(std::size_t{0}, inputs.size())) {
-    sources[i] = {.labels = access::preps(plan)[i].labels_after,
-                  .layout = geom.preps[i].after,
-                  .scratch = geom.preps[i].reduced,
-                  .offset = geom.preps[i].reduced_offset,
+  FixedVec<Labels, kMaxOperands> live_labels;
+  for (const auto &[i, prep, pg] : std::views::zip(
+           std::views::iota(std::size_t{0}), access::preps(plan), geom.preps)) {
+    sources[i] = {.labels = prep.labels_after,
+                  .layout = pg.after,
+                  .scratch = pg.reduced,
+                  .offset = pg.reduced_offset,
                   .operand = static_cast<std::uint8_t>(i)};
+    live_labels.push_back(prep.labels_after);
   }
 
-  FixedVec<Labels, kMaxOperands> live_labels;
-  for (const auto i : std::views::iota(std::size_t{0}, inputs.size())) {
-    live_labels.push_back(access::preps(plan)[i].labels_after);
-  }
   const auto chosen = choose_path(order, std::span<const Labels>{live_labels},
                                   plan.output_labels(), *bound);
   if (!chosen) {
@@ -371,9 +345,7 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
   }
   geom.path = *chosen;
 
-  for (const auto si :
-       std::views::iota(std::size_t{0}, geom.path.steps.size())) {
-    const Step &step = geom.path.steps[si];
+  for (const auto &[si, step] : geom.path.steps | std::views::enumerate) {
     const Source &left = sources[step.l_src];
     const Source &right = sources[step.r_src];
 
@@ -392,8 +364,8 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
     sg.r_operand = right.operand;
     sg.r_offset = right.offset;
 
-    // The result: the caller's output on the last step, otherwise a fresh
-    // contiguous tensor in batch ++ m ++ n order, which is trivially mappable.
+    // The caller's output on the last step, otherwise a contiguous tensor in
+    // batch ++ m ++ n order, which is trivially mappable.
     Labels target_labels = step.target;
     Layout target_layout;
     if (step.writes_output) {
@@ -401,10 +373,7 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
       target_layout = out;
       sg.out_scratch = false;
     } else {
-      Shape target_shape;
-      for (const char c : step.target) {
-        target_shape.push_back((*bound)[c].extent);
-      }
+      const Shape target_shape = shape_over(step.target, *bound);
       target_layout = make_layout(target_shape, row_major);
       sg.out_scratch = true;
       sg.out_offset = bump.take(product(target_shape));
@@ -413,8 +382,7 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
                        detail::pick(target_labels, target_layout, step.m),
                        detail::pick(target_labels, target_layout, step.n));
 
-    // Packing buffers, one per unmappable side.  Reused across batches, so one
-    // rectangle each is all it takes.
+    // Reused across batches, so one rectangle per unmappable side.
     if (!sg.l.mappable) {
       sg.l.pack_offset = bump.take(sg.m() * sg.k());
     }
@@ -427,12 +395,12 @@ make_geometry(const Plan &plan, const std::span<const Layout> inputs,
 
     geom.steps.push_back(sg);
 
-    // The intermediate this step just made, for whatever step consumes it.
-    sources[kIntermediate + si] = {.labels = step.target,
-                                   .layout = target_layout,
-                                   .scratch = sg.out_scratch,
-                                   .offset = sg.out_offset,
-                                   .operand = 0};
+    sources[kIntermediate + static_cast<std::size_t>(si)] = {
+        .labels = step.target,
+        .layout = target_layout,
+        .scratch = sg.out_scratch,
+        .offset = sg.out_offset,
+        .operand = 0};
   }
 
   geom.scratch_elems = bump.cursor;

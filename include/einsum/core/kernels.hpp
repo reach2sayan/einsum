@@ -12,18 +12,13 @@
 #include <ranges>
 #include <type_traits>
 
-// The only place Eigen is called.  Everything above builds descriptions; each
-// kernel below turns one into Map expressions, and every loop that could have
-// been over elements is over a vector or a matrix instead.
-//
-// The kernels are strategy types rather than free functions: execute() selects
-// one per step from the Geometry and knows nothing else about it.
+// The only place Eigen is called.  Strategy types rather than free functions:
+// execute() selects one per step from the Geometry.
 namespace einsum::impl {
 
-// Inner stride 1 at compile time in both, which is the whole point: Eigen's
-// blas_traits refuses direct access to an operand whose inner stride it cannot
-// see is 1, and evaluates it into a heap temporary instead.  A column-major map
-// is how a transposed block keeps that property without a Transpose expression.
+// Inner stride 1 at compile time in both: Eigen's blas_traits evaluates an
+// operand whose inner stride it cannot see is 1 into a heap temporary.  A
+// column-major map keeps that for a transposed block, without a Transpose.
 template <CScalar T>
 using RowMap = Eigen::Map<
     Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>,
@@ -48,14 +43,9 @@ template <CScalar T>
 using CVecMap = Eigen::Map<const Eigen::Matrix<T, Eigen::Dynamic, 1>,
                            Eigen::Unaligned, Eigen::InnerStride<>>;
 
-// The compile-time fast path's maps: every extent in the type, so the product
-// is unrolled rather than blocked.  The storage order is a parameter because an
-// operand keeps its own -- a column-major A times a column-major B into a
-// column-major C is a plain fixed product, and forcing row-major on it would
-// mean transposing three matrices to no purpose.
-//
-// A single column has to be column-major and a single row row-major, whatever
-// the operand's own order says; Eigen refuses the other pairing.
+// The compile-time path's maps: every extent in the type, so the product is
+// unrolled rather than blocked.  A single column has to be column-major and a
+// single row row-major whatever the operand's order; Eigen refuses the rest.
 [[nodiscard]] consteval int fixed_order(const index_t rows, const index_t cols,
                                         const bool row_order) noexcept {
   if (cols == 1) {
@@ -76,15 +66,11 @@ using FixedMap =
     Eigen::Map<Eigen::Matrix<T, static_cast<int>(R), static_cast<int>(C),
                              fixed_order(R, C, RowOrder)>>;
 
-// --- gathering ---------------------------------------------------------------
-// A rectangle Eigen cannot address becomes one it can: rows x cols, row-major,
-// contiguous.  scatter() is the same journey back, for an output whose strides
-// Eigen could not write to.  One body, parameterised on which side is strided
-// -- the two differ only in that.
+// A rectangle Eigen cannot address becomes one it can, and back again for an
+// output.  One body, parameterised on which side is strided.
 enum class Direction : std::uint8_t { gather, disperse };
 
-// Constness follows the direction, so neither call site needs a cast; T is not
-// deduced from either pointer and every caller names it.
+// Constness follows the direction, so neither call site needs a cast.
 template <Direction D, CScalar T>
 using PackedPtr = std::conditional_t<D == Direction::gather, T *, const T *>;
 template <Direction D, CScalar T>
@@ -125,9 +111,8 @@ void shuffle(PackedPtr<D, T> packed, StridedPtr<D, T> strided,
       rows);
 }
 
-// --- the step strategies -----------------------------------------------------
-// One GEMM per batch.  The three nested dispatches pick a row- or column-major
-// Map per operand; there is no runtime branch inside the product itself.
+// One GEMM per batch.  The nested dispatches pick each operand's Map order, so
+// there is no runtime branch inside the product.
 struct GemmKernel {
   template <CScalar T>
   static void run(const StepGeom &g, const T *left, const T *right, T *out,
@@ -135,8 +120,7 @@ struct GemmKernel {
     const index_t m = g.m();
     const index_t n = g.n();
     const index_t k = g.k();
-    // One walk per operand, advanced together: the three batch groups name the
-    // same labels and so have the same extents, which is what makes them zip.
+    // The three batch groups name the same labels, so one walk serves all.
     for_each_offset(
         [&](const index_t lb, const index_t rb, const index_t ob) noexcept {
           const T *lp = left + lb;
@@ -198,9 +182,8 @@ struct GemmKernel {
   }
 };
 
-// m == n == k == 1: every "matrix" is a scalar and the whole step is the batch.
-// One vector multiply when all three batch groups nest, which they do whenever
-// the operands agree on their axis order.
+// m == n == k == 1: every "matrix" is a scalar and the step is the batch.  One
+// vector multiply when all three batch groups nest.
 struct HadamardKernel {
   template <CScalar T>
   static void run(const StepGeom &g, const T *left, const T *right, T *out,
@@ -233,10 +216,8 @@ concept CStepKernel =
 static_assert(CStepKernel<GemmKernel, double>);
 static_assert(CStepKernel<HadamardKernel, double>);
 
-// --- the sum a contraction never sees ----------------------------------------
-// Labels no other operand has and the output does not want, summed before the
-// operand enters a step -- so the GEMM above is over the smallest tensor that
-// still answers the subscript.
+// Labels nothing else wants, summed before the operand enters a step, so the
+// GEMM is over the smallest tensor that still answers the subscript.
 struct ReduceKernel {
   template <CScalar T>
   static void run(const PrepGeom &pg, const T *src, T *dst) noexcept {
@@ -249,8 +230,7 @@ struct ReduceKernel {
                                 Eigen::InnerStride<>{pg.red_run.stride}}
                          .sum();
           } else {
-            // The reduced axes do not collapse to one stride, so there is no
-            // vector for Eigen to sum: the offsets are added one at a time.
+            // No single stride, so no vector for Eigen to sum.
             T acc{};
             for_each_offset(
                 [&](const index_t red) noexcept { acc += base[red]; }, pg.red);
@@ -262,10 +242,8 @@ struct ReduceKernel {
   }
 };
 
-// --- the one-operand strategy ------------------------------------------------
-// src is already permuted into the destination's axis order, so this is a copy
-// whose two sides disagree only about strides.  The innermost axis is one
-// vector assignment, whatever either side's stride along it happens to be.
+// src is already permuted into the destination's axis order, so the two sides
+// disagree only about strides and the innermost axis is one assignment.
 struct PermuteKernel {
   template <CScalar T>
   static void run(const TensorView<T> &dst, const T *src,

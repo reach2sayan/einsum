@@ -1022,7 +1022,7 @@ namespace {
     const std::initializer_list<std::pair<char, index_t>> pairs) {
   es::BoundExtents bound;
   for (const auto &[c, e] : pairs) {
-    bound[c] = {.extent = e, .known = true, .broadcast = false};
+    bound[c] = {.extent = e, .known = true};
   }
   return bound;
 }

@@ -14,14 +14,12 @@
 
 namespace einsum {
 
+// Where a term's '...' sits among its written labels, or this when it has none.
+inline constexpr std::uint8_t kNoEllipsis = 255;
+
 // What a subscript says, before any operand has been looked at.  The same
 // struct comes out of the constexpr parser below and out of the Boost.Parser
 // one in src/rt/parse.cpp; tests/tests_parse.cpp checks that they agree.
-// Where a term's '...' sits among its written labels, or kNoEllipsis when it
-// has none.  A position rather than a flag, because "i...j" puts the broadcast
-// axes between the two named ones.
-inline constexpr std::uint8_t kNoEllipsis = 255;
-
 struct Subscripts {
   impl::FixedVec<Labels, kMaxOperands> operands{};
   impl::FixedVec<std::uint8_t, kMaxOperands> ellipsis_at{};
@@ -39,22 +37,20 @@ namespace impl {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-// How often each label appears.  once_per_operand counts a repeat inside one
-// operand as one occurrence, which is what "does anybody else have this label"
-// means; counting every occurrence is what an implicit output needs. Saturating
-// at two, because two occurrences and twenty mean the same thing to both
-// callers.
+// How often each label appears, saturating at two.  once_per_operand counts a
+// repeat inside one operand once, which is what "does anybody else have this
+// label" means; every occurrence is what an implicit output needs.
 [[nodiscard]] constexpr LabelTable<std::uint8_t>
 count_labels(const FixedVec<Labels, kMaxOperands> &operands,
              const bool once_per_operand) noexcept {
   LabelTable<std::uint8_t> counts;
   for (const Labels &op : operands) {
-    // enumerate, because "is this the first time this operand says c" is a
-    // question about the position as well as the character.
-    for (const auto [a, c] : op | std::views::enumerate) {
-      if (once_per_operand && index_of(op, c) != static_cast<std::size_t>(a)) {
-        continue;
-      }
+    const auto first_here = [&](const auto &pair) noexcept {
+      const auto [at, c] = pair;
+      return !once_per_operand || index_of(op, c) == static_cast<std::size_t>(at);
+    };
+    for (const char c : op | std::views::enumerate |
+                            std::views::filter(first_here) | std::views::values) {
       std::uint8_t &n = counts[c];
       n = static_cast<std::uint8_t>(n < 2 ? n + 1 : n);
     }
@@ -62,25 +58,16 @@ count_labels(const FixedVec<Labels, kMaxOperands> &operands,
   return counts;
 }
 
-// NumPy's implicit output: the labels that occur exactly once across the whole
-// input, in ascending character order.  Note "sorted", not "first seen" --
-// "ba" infers "->ab", which is the one behaviour change from v1.
+// NumPy's implicit output: the labels occurring exactly once across the whole
+// input, in ascending character order -- so "ba" infers "->ab".  kLabelChars,
+// not the table's slot order, because 'Z' sorts before 'a'.  A longer run than
+// kMaxRank cannot happen and would truncate.
 [[nodiscard]] constexpr Labels
 implicit_output(const FixedVec<Labels, kMaxOperands> &operands) noexcept {
   const LabelTable<std::uint8_t> seen = count_labels(operands, false);
-  Labels out;
-  // kLabelChars, not the table's own slot order: the output is sorted by
-  // character, and 'Z' sorts before 'a'.
-  auto once = kLabelChars | std::views::filter(
-                                [&seen](const char c) { return seen[c] == 1; });
-  // Cannot overflow: a label occurring once is one of at most kMaxRank distinct
-  // ones per operand.  Checked anyway.
-  for (const char c : once) {
-    if (!out.try_push_back(c)) {
-      return out;
-    }
-  }
-  return out;
+  return {std::from_range,
+          kLabelChars | std::views::filter(
+                            [&seen](const char c) { return seen[c] == 1; })};
 }
 
 // What neither parser needs a grammar to see.
@@ -96,17 +83,17 @@ precheck(const std::string_view source) noexcept {
 // An explicit output has to name labels that exist, and name each one once.
 [[nodiscard]] constexpr result<void>
 validate_output(const Subscripts &subs) noexcept {
-  for (const char c : subs.output) {
-    const bool known =
-        std::ranges::any_of(subs.operands, [c](const Labels &op) {
-          return std::ranges::contains(op, c);
-        });
-    if (!known) {
-      return fail(errc::unknown_output_label);
-    }
-    if (std::ranges::count(subs.output, c) > 1) {
-      return fail(errc::repeated_output_label);
-    }
+  const auto known = [&](const char c) noexcept {
+    return std::ranges::any_of(subs.operands, [c](const Labels &op) {
+      return std::ranges::contains(op, c);
+    });
+  };
+  if (!std::ranges::all_of(subs.output, known)) {
+    return fail(errc::unknown_output_label);
+  } else if (std::ranges::any_of(subs.output, [&](const char c) {
+               return std::ranges::count(subs.output, c) > 1;
+             })) {
+    return fail(errc::repeated_output_label);
   }
   return {};
 }
@@ -120,9 +107,8 @@ finish_subscripts(Subscripts subs) noexcept {
   }
   if (!subs.explicit_output) {
     subs.output = implicit_output(subs.operands);
-    // NumPy's rule: the broadcast axes come first, then the labels seen exactly
-    // once.  The count is not known until the operands arrive, so the output
-    // records only that they lead.
+    // NumPy's rule: the broadcast axes lead, then the once-labels.  How many
+    // there are is not known until the operands arrive.
     if (std::ranges::any_of(subs.ellipsis_at, [](const std::uint8_t at) {
           return at != kNoEllipsis;
         })) {
@@ -144,8 +130,8 @@ parse_subscripts(const std::string_view source) noexcept {
   std::uint8_t current_ellipsis = kNoEllipsis;
   bool in_output = false;
 
-  // Closing a term keeps its labels and its '...' position together, which is
-  // the only reason the two vectors stay the same length.
+  // A term's labels and its '...' position are stored together, which is what
+  // keeps the two vectors the same length.
   const auto close_term = [&]() noexcept {
     const bool ok = subs.operands.try_push_back(current) &&
                     subs.ellipsis_at.try_push_back(current_ellipsis);
@@ -187,8 +173,7 @@ parse_subscripts(const std::string_view source) noexcept {
       continue;
     }
     if (c == '.') {
-      // Exactly three, and at most one per term.  Anything else is a typo, not
-      // a shorthand.
+      // Exactly three, and at most one per term.
       if (i + 2 >= source.size() || source[i + 1] != '.' ||
           source[i + 2] != '.') {
         return fail(errc::bad_syntax);
@@ -222,13 +207,11 @@ parse_subscripts(const std::string_view source) noexcept {
   return finish_subscripts(subs);
 }
 
-// --- expanding '...'
-// ---------------------------------------------------------- Every '...'
-// becomes as many synthetic labels as the operand ranks say it stands for,
-// after which nothing downstream knows an ellipsis was ever there. The
-// dimensions are right-aligned across operands, as NumPy aligns them: an
-// operand covering fewer of them takes the LAST of the broadcast labels, so a
-// (3, 4) and a (5, 3, 4) meet on their trailing axes.
+// Every '...' becomes as many synthetic labels as the operand ranks say it
+// stands for, after which nothing downstream knows an ellipsis was there.  The
+// dimensions are right-aligned as NumPy aligns them: an operand covering fewer
+// of them takes the LAST of the broadcast labels, so (3, 4) and (5, 3, 4) meet
+// on their trailing axes.
 [[nodiscard]] constexpr result<Subscripts>
 expand(const Subscripts &subs,
        const std::span<const std::uint8_t> ranks) noexcept {
@@ -236,27 +219,25 @@ expand(const Subscripts &subs,
     return fail(errc::operand_count_mismatch);
   }
 
-  // How many axes each '...' stands for, and the widest of them.
-  impl::FixedVec<std::uint8_t, kMaxOperands> covered;
-  std::size_t widest = 0;
-  for (const auto i : std::views::iota(std::size_t{0}, ranks.size())) {
-    const std::size_t named = subs.operands[i].size();
-    if (ranks[i] < named) {
+  FixedVec<std::uint8_t, kMaxOperands> covered;
+  for (const auto &[rank, labels, at] :
+       std::views::zip(ranks, subs.operands, subs.ellipsis_at)) {
+    if (rank < labels.size()) {
       return fail(errc::rank_mismatch);
     }
-    const std::size_t nb = ranks[i] - named;
-    if (subs.ellipsis_at[i] == kNoEllipsis && nb != 0) {
+    const std::size_t nb = rank - labels.size();
+    if (at == kNoEllipsis && nb != 0) {
       return fail(errc::rank_mismatch);
     }
     covered.push_back(static_cast<std::uint8_t>(nb));
-    widest = nb > widest ? nb : widest;
   }
+  const std::size_t widest =
+      covered.empty() ? 0 : std::ranges::max(covered);
   if (widest > kMaxRank) {
     return fail(errc::rank_too_high);
   }
 
   if (widest == 0 && subs.output_ellipsis_at == kNoEllipsis) {
-    // Nothing to expand, and nothing that needed naming.
     return subs;
   }
   if (widest > 0 && subs.output_ellipsis_at == kNoEllipsis) {
@@ -281,13 +262,15 @@ expand(const Subscripts &subs,
   };
 
   Subscripts out = subs;
-  for (const auto i : std::views::iota(std::size_t{0}, ranks.size())) {
-    const auto term = splice(subs.operands[i], subs.ellipsis_at[i], covered[i]);
-    if (!term) {
-      return std::unexpected{term.error()};
+  for (auto &&[term, at, in_labels, in_at, nb] :
+       std::views::zip(out.operands, out.ellipsis_at, subs.operands,
+                       subs.ellipsis_at, covered)) {
+    const auto spliced = splice(in_labels, in_at, nb);
+    if (!spliced) {
+      return std::unexpected{spliced.error()};
     }
-    out.operands[i] = *term;
-    out.ellipsis_at[i] = kNoEllipsis;
+    term = *spliced;
+    at = kNoEllipsis;
   }
   const auto output = splice(subs.output, subs.output_ellipsis_at, widest);
   if (!output) {

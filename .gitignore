@@ -588,6 +588,3 @@ _skbuild/
 # but a stray in-source configure would put them here, and they are artifacts.
 /python/einsum/*.so
 /python/einsum/*.pyd
-
-# Per-machine, not per-project.
-.claude/settings.local.json

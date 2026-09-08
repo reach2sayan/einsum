@@ -15,16 +15,12 @@ template <std::size_t N> struct FixedString {
 
   // Public by necessity -- see the structural-type note above.
   char data[N];
-
   consteval FixedString(const char (&str)[N]) noexcept {
     std::copy_n(str, N, data);
   }
 
   // Length in characters, excluding the terminating NUL.
   [[nodiscard]] static constexpr std::size_t size() noexcept { return N - 1; }
-
-  // constexpr, not consteval: the runtime parser reads this back to
-  // cross-check.
   [[nodiscard]] constexpr std::string_view view() const noexcept {
     return {data, size()};
   }
@@ -44,15 +40,6 @@ template <std::size_t N> struct FixedString {
 };
 
 template <std::size_t N> FixedString(const char (&)[N]) -> FixedString<N>;
-
-namespace detail {
-template <typename T> inline constexpr bool is_fixed_string_v = false;
-template <std::size_t N>
-inline constexpr bool is_fixed_string_v<FixedString<N>> = true;
-} // namespace detail
-
-template <typename T>
-concept CFixedString = detail::is_fixed_string_v<T>;
 
 namespace detail {
 

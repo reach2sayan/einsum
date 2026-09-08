@@ -14,12 +14,9 @@
 #include <ranges>
 #include <type_traits>
 
-// The operands whose whole Layout is known without an object.  That is what
-// lets einsum<"ij,jk->ik">() lower the whole call at compile time: the extents
-// are in the types, so the Geometry is a constant and the scratch is an array.
-//
-// Value functions, not traits: each of these answers a Layout or a bool, and an
-// if-constexpr chain over the families reads as the question it is asking.
+// The operands whose whole Layout is known without an object, which is what
+// lets einsum<"ij,jk->ik">() lower the whole call at compile time: the Geometry
+// is then a constant and the scratch an array.  Value functions, not traits.
 namespace einsum::ct {
 
 namespace impl {
@@ -91,10 +88,12 @@ template <typename Op>
         shape, row_order ? einsum::impl::row_major : einsum::impl::col_major);
   } else if constexpr (einsum::impl::CMdspanLike<B>) {
     using E = typename B::extents_type;
-    Shape shape;
-    for (const auto i : std::views::iota(std::size_t{0}, E::rank())) {
-      shape.push_back(static_cast<index_t>(E::static_extent(i)));
-    }
+    const Shape shape{
+        std::from_range,
+        std::views::iota(std::size_t{0}, E::rank()) |
+            std::views::transform([](const std::size_t i) {
+              return static_cast<index_t>(E::static_extent(i));
+            })};
     return einsum::impl::make_layout(
         shape, std::same_as<typename B::layout_type, std::layout_right>
                    ? einsum::impl::row_major
@@ -107,8 +106,8 @@ template <typename Op>
 }
 
 namespace detail {
-// A Shape is structural, so the result's extents can be read straight off the
-// one the lowering computed -- no second description of the same shape.
+// A Shape is structural, so the result's extents are read straight off the one
+// the lowering computed.
 template <Shape S, std::size_t... I>
 [[nodiscard]] constexpr auto extents_from(std::index_sequence<I...>) noexcept
     -> std::extents<std::size_t, static_cast<std::size_t>(S.data_[I])...> {
@@ -125,10 +124,9 @@ static_assert(
 static_assert(std::same_as<extents_of_t<Shape{}>, std::extents<std::size_t>>);
 
 // The view family's result when the whole lowering is a constant: every extent
-// in the type and a std::array behind it, so the call touches no allocator at
-// all.  The runtime form of the same thing is an mdarray over dextents and a
-// vector; both are mdarrays, so a caller who moves a call from one path to the
-// other keeps the same indexing.
+// in the type and a std::array behind it, so the call touches no allocator.
+// The runtime form is an mdarray over dextents and a vector, so a caller moving
+// between the two paths keeps the same indexing.
 template <einsum::CScalar T, Shape S>
 using static_mdarray_t = std::experimental::mdarray<
     T, extents_of_t<S>, std::layout_right,

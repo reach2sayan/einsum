@@ -26,7 +26,7 @@ struct PyError : error, std::runtime_error {
 [[noreturn]] inline void fail_with(const errc c) { throw PyError{c}; }
 
 inline void unwrap(const result<void> &r) {
-  if (!r) {
+  if (not r) {
     throw PyError{r.error()};
   }
 }
@@ -36,7 +36,7 @@ inline void unwrap(const result<void> &r) {
 template <typename T>
   requires(!std::is_void_v<T>)
 [[nodiscard]] T unwrap(result<T> &&r) {
-  if (!r) {
+  if (not r) {
     throw PyError{r.error()};
   }
   return std::move(*r);

@@ -91,8 +91,7 @@ def directories(reached: list[Path], name: str, root: Path) -> list[str]:
               for lib in WHOLE.get(name, ()) for f in (root / lib).rglob("*")
               if f.is_file()}
     names.discard(".")
-    if not names:
-        sys.exit(f"the closure reached no {name} headers; that cannot be right")
+    if not names: sys.exit(f"the closure reached no {name} headers; that cannot be right")
     # "boost" sorts before "boost/assert": a prefix is shorter than what extends it.
     return sorted(names)
 
@@ -112,8 +111,7 @@ def main() -> int:
     roots = {}
     for name, (pin, layout, witness) in DEPS.items():
         found = re.search(pin, pinned)
-        if found is None:
-            sys.exit(f"no pin for {name} in {DEPENDENCIES}")
+        if found is None: sys.exit(f"no pin for {name} in {DEPENDENCIES}")
         root = (args.deps / layout.format(found.group(1))).resolve()
         if not (root / witness).is_file():
             sys.exit(f"no {name} at {root}: it has no {witness}.  Configure once "
@@ -145,7 +143,6 @@ def main() -> int:
         print(f"  {name:7} {len(dirs):4} directories, {files:5} files")
     print(f"{GENERATED.relative_to(ROOT)}: asked {cxx}")
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

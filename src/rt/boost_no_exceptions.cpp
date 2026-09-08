@@ -23,13 +23,15 @@ namespace boost {
 #endif
 
 EINSUM_BOOST_THROW_VISIBILITY void throw_exception(const std::exception &e) {
-  std::fprintf(stderr, "einsum: boost threw with exceptions disabled: %s\n", e.what());
+  std::fprintf(stderr, "einsum: boost threw with exceptions disabled: %s\n",
+               e.what());
   std::abort();
 }
 
 EINSUM_BOOST_THROW_VISIBILITY void throw_exception(const std::exception &e,
                                                    const source_location &loc) {
-  std::fprintf(stderr, "einsum: boost threw with exceptions disabled: %s (%s:%u)\n",
+  std::fprintf(stderr,
+               "einsum: boost threw with exceptions disabled: %s (%s:%u)\n",
                e.what(), loc.file_name(), loc.line());
   std::abort();
 }

@@ -12,24 +12,20 @@
 #include <utility>
 
 // What an operand may be, decided by how it is indexed rather than by which
-// library it came from.  Two accessor models, because there are two ways C++
-// spells "the element at (i, j)": one subscript taking every index, and a chain
-// of subscripts taking one each.  Everything else about an operand -- its
-// extents, its scalar, whether its memory is contiguous -- is read through
-// whichever of the two it answers to.
+// library it came from: one subscript taking every index, or a chain taking
+// one each.
 namespace einsum {
 
 namespace impl {
 
-// Which of the pack the "all the same" question is asked against.  The only
-// type computation here, and only because a type is what it answers.
+// Which of the pack the "all the same" question is asked against.
 template <typename First, typename...> struct first_of {
   using type = First;
 };
 template <typename... Ops> using first_of_t = typename first_of<Ops...>::type;
 
-// Eigen's own idea of a dense object: the memory has to be there.  A Product
-// has no data() and is not one.
+// Eigen's own idea of a dense object: the memory has to be there, so a Product
+// -- which has no data() -- is not one.
 template <typename D>
 concept CEigenDense =
     std::derived_from<D, Eigen::DenseBase<D>> && requires(const D &d) {
@@ -38,9 +34,8 @@ concept CEigenDense =
       { d.data() } -> std::convertible_to<const typename D::Scalar *>;
     };
 
-// Eigen's unsupported Tensor module, recognised by its shape rather than by
-// name: this header does not include <unsupported/Eigen/CXX11/Tensor>, because
-// most callers do not want it, and a caller who does has already included it.
+// Eigen's Tensor module by shape, not by name: this header does not include
+// <unsupported/Eigen/CXX11/Tensor>, and a caller who wants one already has.
 template <typename X>
 concept CEigenTensor = requires(const X &x) {
   typename X::Scalar;
@@ -50,8 +45,8 @@ concept CEigenTensor = requires(const X &x) {
   { x.data() } -> std::convertible_to<const typename X::Scalar *>;
 };
 
-// An mdarray: an mdspan that owns its elements.  It is what a view-family call
-// hands back, and it is contiguous, so the kernels write into it directly.
+// An mdspan that owns its elements: what a view-family call hands back, and
+// contiguous, so the kernels write into it directly.
 template <typename X>
 concept CMdarray = requires(const X &x) {
   { x.to_mdspan() };
@@ -59,11 +54,8 @@ concept CMdarray = requires(const X &x) {
   { x.data() };
 };
 
-// An mdspan, or anything that describes itself the way one does.  Naming the
-// operations rather than the class template lets a conforming reimplementation
-// through.
-// The rank is asked for rather than searched: a rank-0 mdspan or mdarray takes
-// no indices at all, so probing x[i] for i = 1.. can never find it.
+// Named by its operations, so a conforming reimplementation is one too.  The
+// rank is asked for rather than searched: a rank-0 mdspan takes no indices.
 template <typename X>
 concept CMdspanLike = requires(const X &x, std::size_t r) {
   { X::rank() } -> std::convertible_to<std::size_t>;
@@ -72,10 +64,8 @@ concept CMdspanLike = requires(const X &x, std::size_t r) {
 
 } // namespace impl
 
-// --- the accessor models -----------------------------------------------------
-// x[i, j, ...]: one subscript, every index.  Eigen's dense objects and its
-// Tensors belong here too -- their accessor is spelled (i, j), which is the
-// same thing wearing older syntax.
+// x[i, j, ...]: one subscript, every index.  Eigen's (i, j) is the same thing
+// in older syntax.
 template <typename X>
 concept CMultiIndexable = impl::CMdspanLike<std::remove_cvref_t<X>> ||
                           impl::CEigenDense<std::remove_cvref_t<X>> ||
@@ -83,8 +73,7 @@ concept CMultiIndexable = impl::CMdspanLike<std::remove_cvref_t<X>> ||
 
 namespace impl {
 
-// x[i][j]...: a range whose elements are ranges, down to a scalar leaf.  The
-// depth is the rank, and it is found by descending.
+// x[i][j]...: ranges down to a scalar leaf, the depth being the rank.
 template <typename X> [[nodiscard]] consteval std::size_t nest_rank() noexcept;
 
 template <typename X> struct nest_leaf {
@@ -111,9 +100,8 @@ template <typename X> [[nodiscard]] consteval std::size_t nest_rank() noexcept {
 
 } // namespace impl
 
-// A nest is a range whose leaf is a scalar.  Ruled out for anything that
-// already answers a multidimensional subscript, so an mdspan is never mistaken
-// for a one-deep nest.
+// Ruled out for anything answering a multidimensional subscript, so an mdspan
+// is never mistaken for a one-deep nest.
 template <typename X>
 concept CNestedIndexable =
     !CMultiIndexable<X> && std::ranges::range<std::remove_cvref_t<X>> &&
@@ -126,9 +114,8 @@ concept COperand = CMultiIndexable<X> || CNestedIndexable<X>;
 // --- what an operand is made of ----------------------------------------------
 namespace impl {
 
-// One function rather than three partial specialisations: Eigen satisfies both
-// CMultiIndexable and CEigenDense, so specialising on each of them is ambiguous
-// where an if-constexpr chain simply has an order.
+// One function, not three specialisations: Eigen satisfies both
+// CMultiIndexable and CEigenDense, so specialisations are ambiguous.
 template <typename B> [[nodiscard]] consteval auto scalar_probe() noexcept {
   if constexpr (CEigenDense<B> || CEigenTensor<B>) {
     return std::type_identity<typename B::Scalar>{};
@@ -145,8 +132,7 @@ template <COperand X>
 using scalar_of_t = std::remove_cv_t<
     typename decltype(impl::scalar_probe<std::remove_cvref_t<X>>())::type>;
 
-// An Eigen vector is rank 1 however it is stored; everything else says its own
-// rank, and a nest's is how deep it goes.
+// An Eigen vector is rank 1 however it is stored; a nest's rank is its depth.
 template <COperand X> [[nodiscard]] consteval std::size_t rank_of() noexcept {
   using B = std::remove_cvref_t<X>;
   if constexpr (impl::CEigenTensor<B>) {
@@ -163,16 +149,13 @@ template <COperand X> [[nodiscard]] consteval std::size_t rank_of() noexcept {
 template <COperand X> inline constexpr std::size_t rank_v = rank_of<X>();
 
 // --- families ----------------------------------------------------------------
-// Four, because there are four answers to "what shall the result be": an Eigen
-// matrix, an Eigen Tensor (which is where a rank-3 result has to live, since a
-// matrix stops at two), a nest of ranges, or -- for a view, which can own
-// nothing itself -- the owning member of its own family, an mdarray.  A call is
-// in exactly one.
+// Four answers to "what shall the result be", and a call is in exactly one: an
+// Eigen matrix, a Tensor (where a rank-3 result has to live), a nest, or -- for
+// the views, which own nothing -- an mdarray.
 template <typename X>
 concept CEigenFamily = impl::CEigenDense<std::remove_cvref_t<X>>;
 
-// Its own family, not Eigen's: a Tensor and a Matrix cannot be the same result
-// type, and a rank-3 result has to be a Tensor.
+// Its own family: a Tensor and a Matrix cannot be one result type.
 template <typename X>
 concept CTensorFamily = impl::CEigenTensor<std::remove_cvref_t<X>>;
 
@@ -182,21 +165,14 @@ concept CViewFamily = impl::CMdspanLike<std::remove_cvref_t<X>>;
 template <typename X>
 concept CNestFamily = CNestedIndexable<X>;
 
-// Can the contraction be written straight into this result's own storage?
-// True when its elements are one contiguous run the executor can address: the
-// three owning families that guarantee it, plus any rank-1 result, whose single
-// axis is contiguous whatever holds it.  Anything else is filled through a
-// scratch buffer and scattered afterwards.
-//
-// Named once because both entry points ask it -- BasicEinsum::evaluate and
-// StaticEinsum::Lowered -- and a family added to one spelling but not the other
-// would silently scatter into a buffer the caller never reads.
+// Can the contraction be written straight into this result's storage?  Anything
+// else is filled through scratch and scattered.  Both entry points ask it.
 template <typename R>
 concept CDirectWritable = impl::CEigenDense<R> || impl::CEigenTensor<R> ||
                           impl::CMdarray<R> || rank_v<R> == 1;
 
-// One family and one scalar across the call.  Ranks may differ -- "ij,j->i" is
-// a matrix and a vector -- so this is deliberately not "the same type".
+// One family and one scalar across the call; ranks may differ, so not "the
+// same type".
 template <typename... Ops>
 concept CSameFamily =
     sizeof...(Ops) > 0 && (COperand<Ops> && ...) &&
@@ -206,14 +182,13 @@ concept CSameFamily =
      ...);
 
 // The rank the result is built at when the subscript is not in a type: the
-// widest operand, which is the only rank every family can always represent.
+// only one every family can represent.
 template <typename... Ops>
 inline constexpr std::size_t widest_rank_v = std::max({rank_v<Ops>...});
 
 namespace impl {
-// And the operand that has it -- which is the type a family whose rank lives in
-// its type (a std::array nest, an Eigen Tensor) has to build its result from,
-// since neither can be spelled here without naming the library that owns it.
+// And the operand that has it: what a family carrying its rank in its type
+// builds its result from.
 template <typename... Ops> struct widest_of;
 template <typename A> struct widest_of<A> {
   using type = A;

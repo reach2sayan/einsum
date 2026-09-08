@@ -14,21 +14,19 @@
 // The subscript grammar, and the only translation unit that sees Boost.Parser
 // -- which wraps every parse() in a try/catch and so cannot compile under the
 // -fno-exceptions the rest of einsum is built with.  The CMakeLists beside this
-// file takes the flag off this one object, and the catch below is what keeps
-// that local: nothing thrown here reaches a caller.
+// file takes the flag off this one object, and the catch below keeps that
+// local: nothing thrown here reaches a caller.
 //
-// Everything this file decides that is not the shape of the text -- the
-// ellipsis refusal, the implicit output, the explicit output's validity -- it
-// decides by calling the same helpers impl::parse_subscripts does, so the two
-// front ends cannot drift apart.  tests/tests_parse.cpp checks that they have
-// not.
+// Everything this file decides that is not the shape of the text it decides by
+// calling the same helpers impl::parse_subscripts does, so the two front ends
+// cannot drift apart; tests/tests_parse.cpp checks that they have not.
 namespace einsum {
 namespace {
 
 namespace bp = boost::parser;
 
-// std::tuple, never boost::hana::tuple.  Nothing here asks for Hana and nothing
-// in this project may pull it in; a default that flipped would do so silently.
+// std::tuple, never boost::hana::tuple: nothing in this project may pull Hana
+// in, and a default that flipped would do so silently.
 static_assert(BOOST_PARSER_USE_STD_TUPLE,
               "einsum::rt: Boost.Parser must use std::tuple, not Hana");
 
@@ -37,8 +35,8 @@ using bp::_globals;
 using bp::_pass;
 
 // Boost.Parser's own handler writes a caret diagnostic to a stream.  einsum
-// reports on the numeric path and nowhere else, so this one says only that the
-// parse failed and leaves the errc to say what about it did.
+// reports on the numeric path alone, so this one says only that the parse
+// failed and leaves the errc to say what about it did.
 struct Silent {
   template <typename Iter, typename Sentinel>
   constexpr bp::error_handler_result
@@ -55,9 +53,9 @@ struct Silent {
 
 // What the actions build.  Carried through with_globals rather than captured:
 // BOOST_PARSER_DEFINE_RULES wants its rules at namespace scope, where a lambda
-// has nothing to capture.  A synthesized attribute would not do either -- the
-// probe that drove this design is that `(operand % ',') >> -("->" >> operand)`
-// collapses the optional output straight into the operand vector.
+// has nothing to capture.  A synthesized attribute would not do either --
+// `(operand % ',') >> -("->" >> operand)` collapses the optional output
+// straight into the operand vector.
 struct Building {
   Subscripts subs{};
   Labels current{};
@@ -67,17 +65,13 @@ struct Building {
   bool refused = false;
 };
 
-// --- the actions -------------------------------------------------------------
 namespace act {
 
 // One refusal shape for every limit: name the code, fail the parser, and let
-// the caller read `why` back once the whole parse has failed.
-//
-// The first refusal wins.  A parser that fails backtracks into whatever the
-// grammar offers next, and the alternative's own complaint is about the text it
-// was handed rather than about the one that actually went wrong: a ninth
-// operand refused as too_many_operands must not be re-reported as an empty one
-// by the eps that follows it.
+// the caller read `why` back once the whole parse has failed.  The first
+// refusal wins, because a failing parser backtracks into whatever the grammar
+// offers next: a ninth operand refused as too_many_operands must not be
+// re-reported as an empty one by the eps that follows it.
 template <errc C>
 constexpr auto refuse = [](auto &ctx) {
   Building &building = _globals(ctx);
@@ -112,14 +106,15 @@ constexpr auto end_operand = [](auto &ctx) {
 // At most one per term, at whatever position it was written.
 constexpr auto mark_ellipsis = [](auto &ctx) {
   Building &building = _globals(ctx);
-  std::uint8_t &at =
-      building.in_output ? building.subs.output_ellipsis_at : building.current_ellipsis;
+  std::uint8_t &at = building.in_output ? building.subs.output_ellipsis_at
+                                        : building.current_ellipsis;
   if (at != kNoEllipsis) {
     refuse<errc::ellipsis_repeated>(ctx);
     return;
   }
-  at = static_cast<std::uint8_t>(building.in_output ? building.subs.output.size()
-                                                    : building.current.size());
+  at =
+      static_cast<std::uint8_t>(building.in_output ? building.subs.output.size()
+                                                   : building.current.size());
 };
 
 // Fires on the arrow itself, so the labels after it land in the output.
@@ -191,7 +186,8 @@ result<Einsum> einsum(const std::string_view source, const path order) {
   return parse_subscript(source)
       .and_then(impl::make_plan)
       .transform([order](Plan &&plan) {
-        return impl::einsum_access::make<impl::HeapScratch>(std::move(plan), order);
+        return impl::einsum_access::make<impl::HeapScratch>(std::move(plan),
+                                                            order);
       });
 }
 

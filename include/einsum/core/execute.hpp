@@ -11,12 +11,8 @@
 
 namespace einsum::impl {
 
-// The whole evaluation: reduce, then either one permuted copy or a chain of
-// GEMMs.  noexcept and allocation-free by construction -- every buffer it could
-// want is an offset into `scratch`, sized by make_geometry -- and the only one
-// of these there is: both front ends reach it with a TensorView and a span,
-// whether the memory behind them is a std::array, a std::vector or the
-// caller's own.
+// Reduce, then one permuted copy or a chain of GEMMs.  Allocation-free: every
+// buffer is an offset into `scratch`, sized by make_geometry.
 template <CScalar T>
 void execute(const Plan &plan, const Geometry &geom,
              const std::span<const TensorView<const T>> views,
@@ -40,7 +36,6 @@ void execute(const Plan &plan, const Geometry &geom,
     const T *right =
         sg.r_scratch ? scratch.data() + sg.r_offset : views[sg.r_operand].data;
     T *dst = sg.out_scratch ? scratch.data() + sg.out_offset : out.data;
-    // The Geometry chose the strategy; this is only where it is applied.
     if (sg.hadamard()) {
       HadamardKernel::run<T>(sg, left, right, dst, scratch.data());
     } else {
