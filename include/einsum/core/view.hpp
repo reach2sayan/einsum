@@ -171,6 +171,12 @@ struct TensorView {
   }
 };
 
+// Written out because MSVC does not form the aggregate one (P1816) here: at the
+// single CTAD site it reports only the implicit default and copy guides and
+// then fails to deduce T.  GCC and Clang need nothing, and deduce exactly this.
+template <typename T>
+TensorView(T *, Layout) -> TensorView<T>;
+
 // A matrix is rank 2 with the row stride first -- the inner one when it is
 // column-major.
 template <CEigenDense D>
