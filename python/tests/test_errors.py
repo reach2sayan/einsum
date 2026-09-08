@@ -56,4 +56,6 @@ def test_a_rank_past_the_limit_is_refused():
 
 def test_something_that_is_not_an_array():
     with pytest.raises(TypeError):
-        einsum.contract("ij->ji", object())
+        # Passing something that is not an array is the whole test, so mypy
+        # objecting is the annotation working rather than a defect to fix.
+        einsum.contract("ij->ji", object())  # type: ignore[arg-type]

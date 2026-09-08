@@ -40,4 +40,8 @@ def test_reuse_is_the_point():
 def test_path_is_part_of_the_object():
     assert einsum.einsum("ij,jk->ik", path=einsum.Path.SEQUENTIAL) is not None
     with pytest.raises(TypeError):
-        einsum.einsum("ij,jk->ik", einsum.Path.SEQUENTIAL)  # keyword-only
+        # keyword-only; the ignore is the assertion restated for mypy, which
+        # rejects this call for exactly the reason the test expects it to fail
+        # at run time.  Narrow on purpose: if it ever stops being a call-arg
+        # error, this line stops type-checking and says so.
+        einsum.einsum("ij,jk->ik", einsum.Path.SEQUENTIAL)  # type: ignore[call-arg]

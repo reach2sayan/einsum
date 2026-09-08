@@ -345,6 +345,14 @@ jobs:
       - name: Python environment
         run: uv sync --group dev --no-install-project
 
+      # Before the build, because it does not need one: `einsum._einsum` is
+      # resolved from the committed python/einsum/_einsum.pyi rather than from a
+      # compiled module, so this fails in seconds on a bad annotation instead of
+      # after the extension has been built.  --no-sync: the environment above is
+      # deliberately without an installed einsum, and `uv run` would add one.
+      - name: Type-check
+        run: uv run --no-sync mypy --config-file pyproject.toml
+
       - name: Configure and build
         env:
           CXX: g++-14

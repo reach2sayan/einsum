@@ -31,7 +31,7 @@ Linux wheel is such a build, the Windows one is not.
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from ._einsum import (
     MAX_OPERANDS,
@@ -95,4 +95,9 @@ def contract(subscripts: str, /, *operands: ArrayLike,
     Equivalent to ``einsum(subscripts, path=path)(*operands)``, with the parsed
     subscript remembered between calls.
     """
-    return _plan(subscripts, path)(*operands)
+    # Einsum.__call__ is `-> Any` in the generated stub: pybind11-stubgen writes
+    # what the binding declares, and the binding returns a NumPy array built at
+    # run time from the operands' own dtype.  The cast is where that becomes a
+    # promise to a caller, and it is this function's signature that makes it --
+    # the array really is what the annotation says.
+    return cast("NDArray[np.floating]", _plan(subscripts, path)(*operands))
