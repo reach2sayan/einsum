@@ -67,6 +67,7 @@ def directory_size(root: Path) -> int:
 
 
 def main() -> int:
+    """Stage the package tree; non-zero if anything it should carry is absent."""
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--release", type=Path, required=True, help="Release install prefix"
