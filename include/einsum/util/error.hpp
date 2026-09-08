@@ -22,22 +22,22 @@ namespace einsum {
 // inside a class body.
 //
 // clang-format off
-#define EINSUM_ERRC_SEQ                                                                          \
-  ((bad_syntax,             "the subscript has a character this grammar does not accept"))       \
-  ((ellipsis_repeated,      "a term has more than one '...'"))                                 \
-  ((empty_operand,          "an operand between the commas has no labels"))                      \
-  ((no_operands,            "the subscript names no operands"))                                  \
-  ((too_many_operands,      "more operands than einsum::kMaxOperands"))                          \
-  ((rank_too_high,          "an operand has more labels than einsum::kMaxRank"))                 \
-  ((unknown_output_label,   "the output names a label that no operand has"))                     \
-  ((repeated_output_label,  "the output repeats a label"))                                       \
-                                                                                                 \
-  /* The subscript against the operands it was handed. */                                        \
+#define EINSUM_ERRC_SEQ                                                                            \
+  ((bad_syntax,             "the subscript has a character this grammar does not accept"))         \
+  ((ellipsis_repeated,      "a term has more than one '...'"))                                     \
+  ((empty_operand,          "an operand between the commas has no labels"))                        \
+  ((no_operands,            "the subscript names no operands"))                                    \
+  ((too_many_operands,      "more operands than einsum::kMaxOperands"))                            \
+  ((rank_too_high,          "an operand has more labels than einsum::kMaxRank"))                   \
+  ((unknown_output_label,   "the output names a label that no operand has"))                       \
+  ((repeated_output_label,  "the output repeats a label"))                                         \
+                                                                                                   \
+  /* The subscript against the operands it was handed. */                                          \
   ((operand_count_mismatch, "the subscript and the call disagree on how many operands there are")) \
-  ((rank_mismatch,          "an operand's rank differs from the number of labels it was given")) \
-  ((extent_conflict,        "one label is bound to two different extents"))                      \
-  ((broadcast_mismatch,     "the '...' dimensions do not broadcast"))                            \
-  ((ellipsis_not_in_output, "the operands' '...' covers axes the output does not name"))         \
+  ((rank_mismatch,          "an operand's rank differs from the number of labels it was given"))   \
+  ((extent_conflict,        "one label is bound to two different extents"))                        \
+  ((broadcast_mismatch,     "the '...' dimensions do not broadcast"))                              \
+  ((ellipsis_not_in_output, "the operands' '...' covers axes the output does not name"))           \
   ((output_mismatch,        "the output's rank or extents are not the ones the subscript implies"))
 // clang-format on
 
@@ -47,7 +47,6 @@ namespace einsum {
   BOOST_PP_SEQ_TRANSFORM(EINSUM_ERRC_NAME, ~, EINSUM_ERRC_SEQ)
 
 enum class errc : std::uint8_t { BOOST_PP_SEQ_ENUM(EINSUM_ERRC_NAMES) };
-
 BOOST_DESCRIBE_ENUM(errc, BOOST_PP_SEQ_ENUM(EINSUM_ERRC_NAMES))
 
 struct error {
