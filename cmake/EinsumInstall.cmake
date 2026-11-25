@@ -3,7 +3,7 @@
 # einsum is header-only but for one translation unit, so an installed copy is
 # only usable if Boost, Eigen and mdspan travel with it: all three are fetched
 # against a pin here, and none is a package a machine reliably has -- a distro's
-# Boost predates Boost.Parser, and no libstdc++ on the floor ships <mdspan>.
+# Boost is whatever it froze, and no libstdc++ on the floor ships <mdspan>.
 # What ships is the part of each our own headers reach, which
 # scripts/vendor_headers.py works out by asking the compiler.
 #

@@ -9,13 +9,12 @@
 
 #include <string_view>
 
-// A subscript that is not known until run time.  Its grammar is the only part
-// of the library compiled rather than included, because Boost.Parser's parse()
-// is a try/catch and everything else here is built -fno-exceptions.  Link
-// einsum::rt.
+// A subscript that is not known until run time.  Parsed and planned by the same
+// constexpr functions einsum<"..."> evaluates at compile time; only these two
+// entry points are compiled, into einsum::rt.
 namespace einsum {
 
-// The subscript alone, for cross-checking against impl::parse_subscripts.
+// The subscript alone, as impl::parse_subscripts reads it.
 [[nodiscard]] EINSUM_API result<Subscripts>
 parse_subscript(std::string_view source) noexcept;
 

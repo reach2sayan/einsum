@@ -33,8 +33,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # No libboost-dev: Boost, Eigen and mdspan are fetched against a pin, and
-      # a distribution's idea of Boost is older than Boost.Parser anyway.
+      # No libboost-dev: Boost, Eigen and mdspan are fetched against a pin, so a
+      # distribution's idea of Boost never reaches the build.
       - name: Install the toolchain
         run: |
           sudo apt-get update

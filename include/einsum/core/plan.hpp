@@ -68,8 +68,8 @@ namespace impl {
 struct access;
 } // namespace impl
 
-// Extent-free, allocation-free, a value type, and the same whichever parser
-// built it.
+// Extent-free, allocation-free, a value type, and the same whether it was built
+// at compile time or at run time.
 class Plan {
 public:
   constexpr Plan() noexcept = default;

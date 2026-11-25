@@ -1,6 +1,6 @@
 # Every third-party dependency, pinned and SHA-verified.  Nothing is ever
-# find_package()d: a machine's Boost is whatever the distro froze, and this
-# library needs Boost.Parser, which arrived in 1.87.
+# find_package()d: a machine's Boost is whatever the distro froze, and what this
+# library builds against should not depend on the machine.
 #
 #   einsum_use_boost()             Boost, header-only, fetched   always
 #   einsum_use_eigen()             Eigen 3.4.0, fetched          always

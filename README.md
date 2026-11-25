@@ -86,7 +86,7 @@ machine's idea of "Boost" can change what this builds against.
 
 | | Pin | Used for |
 |---|---|---|
-| Boost | 1.92.0 (`b2-nodocs` tarball) | Parser, Mp11, Preprocessor, Container, Test |
+| Boost | 1.92.0 (`b2-nodocs` tarball) | Mp11, Preprocessor, Container, Test |
 | Eigen | 3.4.0 | every kernel |
 | kokkos mdspan | commit `80fc772e` | `<experimental/mdspan>`; no libstdc++ on the floor ships `<mdspan>` |
 
@@ -139,9 +139,8 @@ away. The team is sized by `OMP_NUM_THREADS`,
 or from Python by `einsum.set_num_threads(n)`; `einsum.OPENMP` says whether a
 build has it at all.
 
-Everything is built `-fno-exceptions` except two targets that cannot be: the one
-object holding the Boost.Parser grammar, and the Boost.Test executables. Nothing
-in any header throws.
+Everything is built `-fno-exceptions` except two targets that cannot be: the
+Python extension and the Boost.Test executables. Nothing in any header throws.
 
 ## Operands
 
@@ -338,9 +337,12 @@ text lives in a static table that `operator<<` and `std::formatter` read.
 ## How it is lowered
 
 ```
-FixedString NTTP ─constexpr parse_subscripts─┐         Boost.Parser (src/rt/parse.cpp)
-                                             ▼                     │
-                                         Subscripts ◄── same struct ┘
+                FixedString NTTP                std::string_view
+                 (compile time)                    (run time)
+                        │                               │
+                        └─ constexpr parse_subscripts ──┘
+                                             ▼
+                                         Subscripts
                                              │ make_plan (constexpr)
                                              ▼
                                             Plan            extent-free, no heap
@@ -424,8 +426,8 @@ target_link_libraries(app PRIVATE einsum::einsum einsum::rt)
 
 One prefix and no other package. Boost, Eigen and mdspan are installed into the
 same include directory as `einsum/`, because all three are fetched against a pin
-here and none is one a machine reliably has -- a distribution's Boost predates
-Boost.Parser, and no libstdc++ on the floor ships `<mdspan>`. What ships is the
+here and none is one a machine reliably has -- a distribution's Boost is whatever
+it froze, and no libstdc++ on the floor ships `<mdspan>`. What ships is the
 part of each our own headers reach, worked out by asking the compiler for the
 include closure:
 
