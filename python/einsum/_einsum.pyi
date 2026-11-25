@@ -89,4 +89,4 @@ def set_num_threads(n: typing.SupportsInt | typing.SupportsIndex) -> None:
 MAX_OPERANDS: int = 8
 MAX_RANK: int = 8
 OPENMP: bool = True
-__version__: str = '2.0.0'
+__version__: str = '2.0.1'
