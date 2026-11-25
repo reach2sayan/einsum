@@ -17,8 +17,9 @@ namespace einsum {
 // Where a term's '...' sits among its written labels, or this when it has none.
 inline constexpr std::uint8_t kNoEllipsis = 255;
 
-// What a subscript says, before any operand is looked at.  Both parsers build
-// one; tests/tests_parse.cpp checks that they agree.
+// What a subscript says, before any operand is looked at.  parse_subscripts
+// builds it, in a constant expression for einsum<"..."> and at run time for
+// einsum(string_view).
 struct Subscripts {
   impl::FixedVec<Labels, kMaxOperands> operands{};
   impl::FixedVec<std::uint8_t, kMaxOperands> ellipsis_at{};
@@ -68,16 +69,6 @@ implicit_output(const FixedVec<Labels, kMaxOperands> &operands) noexcept {
                             [&seen](const char c) { return seen[c] == 1; })};
 }
 
-// What neither parser needs a grammar to see.
-[[nodiscard]] constexpr result<void>
-precheck(const std::string_view source) noexcept {
-  const auto blank = [](const char c) noexcept {
-    return c == ' ' || c == '\t';
-  };
-  return std::ranges::all_of(source, blank) ? fail(errc::no_operands)
-                                            : result<void>{};
-}
-
 // An explicit output has to name labels that exist, and name each one once.
 [[nodiscard]] constexpr result<void>
 validate_output(const Subscripts &subs) noexcept {
@@ -96,7 +87,7 @@ validate_output(const Subscripts &subs) noexcept {
   return {};
 }
 
-// Either parser's last step.
+// What the subscript implies once its text has been read.
 [[nodiscard]] constexpr result<Subscripts>
 finish_subscripts(Subscripts subs) noexcept {
   if (subs.operands.empty()) {
@@ -118,8 +109,11 @@ finish_subscripts(Subscripts subs) noexcept {
 
 [[nodiscard]] constexpr result<Subscripts>
 parse_subscripts(const std::string_view source) noexcept {
-  if (const auto ok = precheck(source); !ok) {
-    return std::unexpected{ok.error()};
+  const auto blank = [](const char c) noexcept {
+    return c == ' ' || c == '\t';
+  };
+  if (std::ranges::all_of(source, blank)) {
+    return fail(errc::no_operands);
   }
 
   Subscripts subs;
@@ -138,7 +132,7 @@ parse_subscripts(const std::string_view source) noexcept {
 
   for (std::size_t i = 0; i < source.size(); ++i) {
     const char c = source[i];
-    if (c == ' ' || c == '\t') {
+    if (blank(c)) {
       continue;
     }
     if (c == '-') {

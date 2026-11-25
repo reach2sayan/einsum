@@ -72,8 +72,8 @@ if (NOT EINSUM_SANITIZE STREQUAL "off")
 endif ()
 
 # einsum_target_flags(<target> [EXCEPTIONS])
-# EXCEPTIONS keeps exceptions on for one target: Boost.Parser's parse() is a
-# try/catch, and Boost.Test's whole reporting path is throw-based.
+# EXCEPTIONS keeps exceptions on for one target: Boost.Test's whole reporting
+# path is throw-based, and pybind11 raises through error_already_set.
 function(einsum_target_flags target)
     cmake_parse_arguments(PARSE_ARGV 1 arg "EXCEPTIONS" "" "")
     set(flags ${EINSUM_CODEGEN_FLAGS})

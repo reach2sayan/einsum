@@ -5,10 +5,11 @@ on:
     tags:
       - "v*.*.*"
   # The same thing without publishing anything: every job below runs, and the
-  # two that publish are gated on `github.ref_type == 'tag'`, so a dispatch on a
-  # branch is a full rehearsal that spends no version number.  Run one after any
-  # change to the nuget leg, to pyproject.toml, to cmake/ or to the pins --
-  # finding out during a tag means finding out with the tag already public.
+  # one that publishes, `release`, is gated on `github.ref_type == 'tag'`, so a
+  # dispatch on a branch is a full rehearsal that spends no version number.
+  # Run one after any change to the nuget leg, to pyproject.toml, to cmake/ or
+  # to the pins -- finding out during a tag means finding out with the tag
+  # already public.
   workflow_dispatch:
 
 # Narrow by default.  The publishing job widens it for itself: `id-token: write`

@@ -1,18 +1,13 @@
-// The two front ends held to one grammar.  Every entry is checked three ways:
-// by the constexpr parser in a static_assert, by the Boost.Parser one at run
-// time, and against each other -- which is the check that matters, since a
-// subscript einsum<"..."> accepts and einsum(string) refuses would be two
-// languages wearing one name.
+// One grammar for both front ends: einsum<"..."> and einsum(string) both call
+// impl::parse_subscripts, so the corpus is checked once, in static_asserts, and
+// the run-time tests below only check that the exported entry points reach it.
 #include "einsum/ct/subscripts.hpp"
 #include "einsum/rt/parse.hpp"
 
 #include <cstdint>
 #include <string_view>
-#include <vector>
 
 #define BOOST_TEST_MODULE EinsumParseSuite
-#include <boost/test/data/monomorphic.hpp>
-#include <boost/test/data/test_case.hpp>
 #include <boost/test/included/unit_test.hpp>
 
 namespace es = einsum;
@@ -72,6 +67,16 @@ static_assert(*parse_subscripts("ii") == expect({"ii"}, "", false));
 static_assert(*parse_subscripts("ii->") == expect({"ii"}, "", true));
 static_assert(*parse_subscripts("ii->i") == expect({"ii"}, "i", true));
 static_assert(*parse_subscripts("i,i->") == expect({"i", "i"}, "", true));
+static_assert(*parse_subscripts("i,j->ij") == expect({"i", "j"}, "ij", true));
+static_assert(*parse_subscripts("ijk->kij") == expect({"ijk"}, "kij", true));
+static_assert(*parse_subscripts("bij,bjk->bik") ==
+              expect({"bij", "bjk"}, "bik", true));
+static_assert(*parse_subscripts("ij,jk,kl->il") ==
+              expect({"ij", "jk", "kl"}, "il", true));
+static_assert(*parse_subscripts("a") == expect({"a"}, "a", false));
+static_assert(*parse_subscripts("ij->") == expect({"ij"}, "", true));
+static_assert(*parse_subscripts("ij->ji") == expect({"ij"}, "ji", true));
+static_assert(failed_with(parse_subscripts("->ij"), errc::empty_operand));
 
 static_assert(failed_with(parse_subscripts(""), errc::no_operands));
 static_assert(failed_with(parse_subscripts("   "), errc::no_operands));
@@ -93,7 +98,7 @@ static_assert(failed_with(parse_subscripts("i...j..."),
                           errc::ellipsis_repeated));
 static_assert(failed_with(parse_subscripts("i.."), errc::bad_syntax));
 // A term may be nothing but a '...': it names no axis of its own, which is not
-// the same as naming none at all, and both parsers have to tell those apart.
+// the same as naming none at all, and the parser has to tell those apart.
 static_assert(*parse_subscripts("...,...") ==
               with_ellipsis(expect({"", ""}, "", false), {0, 0}, 0));
 // The output has its own at-most-one rule, on the other side of the arrow.
@@ -108,63 +113,6 @@ static_assert(failed_with(parse_subscripts("ij->ii"),
                           errc::repeated_output_label));
 
 } // namespace
-
-// Every subscript the suite exercises, so the data-driven pass below covers
-// exactly what the static_asserts above do.  At namespace scope, not in the
-// anonymous one: BOOST_DATA_TEST_CASE names it from its own generated class.
-constexpr std::string_view kCorpus[]{"ij,jk->ik",
-                                     "ij,jk",
-                                     " i j , j k -> i k ",
-                                     "ba",
-                                     "ab,cd",
-                                     "ii",
-                                     "ii->",
-                                     "ii->i",
-                                     "i,i->",
-                                     "i,j->ij",
-                                     "ijk->kij",
-                                     "bij,bjk->bik",
-                                     "ij,jk,kl->il",
-                                     "a",
-                                     "ij->",
-                                     "ij->ji",
-                                     "",
-                                     "   ",
-                                     ",",
-                                     "ij,",
-                                     "ij,,jk",
-                                     "ij-k",
-                                     "ij->ik!",
-                                     "i1",
-                                     "i...",
-                                     "...ij",
-                                     "...i,...i->...i",
-                                     "i...j...",
-                                     "i..",
-                                     "...,...",
-                                     "ij->i...j...",
-                                     "->ij",
-                                     "abcdefghi",
-                                     "a,b,c,d,e,f,g,h,i",
-                                     "ij->ik",
-                                     "ij->ii"};
-
-// One reported case per subscript rather than one loop that stops at the first
-// surprise: the corpus is data, so Boost.Test drives it as data.
-BOOST_DATA_TEST_CASE(ParseTest_FrontEndsAgree,
-                     boost::unit_test::data::make(kCorpus), source) {
-  const auto compile_time = parse_subscripts(source);
-  const auto run_time = es::parse_subscript(source);
-  BOOST_TEST_CONTEXT("subscript = '" << source << "'") {
-    BOOST_REQUIRE_EQUAL(compile_time.has_value(), run_time.has_value());
-    if (compile_time.has_value()) {
-      BOOST_CHECK(*compile_time == *run_time);
-    } else {
-      BOOST_CHECK_EQUAL(es::message(compile_time.error().code),
-                        es::message(run_time.error().code));
-    }
-  }
-}
 
 BOOST_AUTO_TEST_CASE(ParseTest_RuntimeMatchesTheStaticCorpus) {
   BOOST_CHECK(*es::parse_subscript("ij,jk->ik") ==
